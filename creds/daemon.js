@@ -74,6 +74,22 @@ function decValue(key, entry) {
   return Buffer.concat([decipher.update(Buffer.from(entry.data, "base64")), decipher.final()]);
 }
 
+// Verify the derived key before serving anything. AES-GCM auth is all-or-nothing
+// per key, so the first well-formed entry settles it. A fresh/empty box has
+// nothing to check and starts regardless.
+function verifyKey(key, box) {
+  for (const e of Object.values(box.entries)) {
+    if (!e?.nonce || !e?.tag || !e?.data) continue;
+    try {
+      decValue(key, e);
+      return { ok: true };
+    } catch {
+      return { ok: false };
+    }
+  }
+  return { ok: true, empty: true };
+}
+
 // base64 is a single JSON token, so a raw value can't word-wrap in terminal
 // scrollback into something un-decodable.
 function b64(buf) {
@@ -214,6 +230,20 @@ if (!passkey) {
 
 box = loadCredsBox();
 key = deriveKey(passkey, box.salt);
+
+// Fail now with a clear reason, rather than 10 minutes later as a GCM error on
+// the first `get`. Without this the daemon serves happily and every op fails.
+// Order matters: refuse a bad key *before* touching the store, so a mis-keyed
+// unlock can never persist a rewritten expiresAt.
+const check = verifyKey(key, box);
+if (!check.ok) {
+  process.stderr.write("daemon: bad passkey\n");
+  try {
+    key.fill(0);
+  } catch {}
+  key = null;
+  process.exit(2);
+}
 
 // An unlock refreshes the staleness clock on every mirror: "unlocked for TTL X"
 // now means "the vault was live as of this unlock", so mirrors stay servable for

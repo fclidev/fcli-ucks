@@ -260,10 +260,21 @@ function makeFillPrompt() {
 
 async function unlock(passkeyArg, ttl) {
   ensureFDir();
-  const existing = unlockedState();
-  if (existing) {
-    process.stderr.write(`f: already unlocked (${fmt(existing.remainingMs)} left)\n`);
+  // The file existing says nothing about the key it holds — a daemon started with
+  // a wrong passkey serves `ls` fine and fails later on every `get`. Probe it.
+  const live = await probeSocket(SOCKET);
+  if (live) {
+    process.stderr.write(`f: already unlocked (${fmt(live.remainingMs)} left)\n`);
     return true;
+  }
+  // A socket file whose daemon is gone (or whose key is bad) must be cleared,
+  // or the next unlock would report instant false success.
+  if (fs.existsSync(SOCKET)) {
+    for (const f of [SOCKET, LOCKFILE]) {
+      try {
+        fs.unlinkSync(f);
+      } catch {}
+    }
   }
   const passkey = passkeyArg ?? (await promptPasskey());
   if (!passkey) {
@@ -271,16 +282,56 @@ async function unlock(passkeyArg, ttl) {
     return false;
   }
   // Spawn daemon detached; passkey via stdin (not argv).
+  // Capture daemon stderr instead of discarding it, or a failed startup looks
+  // exactly like a successful one.
+  let daemonErr = "";
   const expiresAt = Date.now() + (ttl ?? DEFAULT_TTL) * 1000;
-  const child = spawn(process.execPath, [DAEMON, "--socket", SOCKET, "--lockfile", LOCKFILE, "--ttl", String(ttl ?? DEFAULT_TTL), "--creds", CREDS, "--expires-at", String(expiresAt)], {
-    detached: true,
-    stdio: ["pipe", "ignore", "ignore"],
+  const child = spawn(
+    process.execPath,
+    [
+      DAEMON, "--socket", SOCKET, "--lockfile", LOCKFILE,
+      "--ttl", String(ttl ?? DEFAULT_TTL), "--creds", CREDS,
+      "--expires-at", String(expiresAt),
+    ],
+    { detached: true, stdio: ["pipe", "ignore", "pipe"] }
+  );
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (c) => {
+    if (daemonErr.length < 512) daemonErr += c;
   });
-  child.stdin.write(passkey);
-  child.stdin.end();
+  child.stdin.on("error", () => {}); // daemon may die before reading (bad passkey)
+  child.on("error", (e) => {
+    daemonErr += `spawn failed: ${e.message}\n`;
+  });
+
+  // Deliver the passkey and make sure it is flushed *before* detaching: with
+  // detached:true, unref-ing first can let this process exit while the secret is
+  // still buffered, and the daemon then starts with an empty passkey.
+  await new Promise((resolve) => {
+    child.stdin.on("close", resolve);
+    child.stdin.on("error", resolve);
+    child.stdin.end(passkey);
+  });
+  // Stop holding this process's event loop open on the detached daemon's streams,
+  // or `f` would never exit. Must come after the passkey is flushed.
   child.unref();
-  // Wait briefly for the socket to come up.
-  await waitForSocket(SOCKET, 2000);
+  child.stderr.on("end", () => {});
+
+  const up = await waitForSocket(SOCKET, 2000, child);
+  // Socket on disk is necessary, not sufficient: confirm it answers.
+  const ready = up && (await probeSocket(SOCKET));
+  if (!ready) {
+    const detail = daemonErr.trim().split("\n")[0] || "daemon did not start";
+    // Never leave a socket that has no working daemon behind it.
+    if (!pidAlive(readLockfile()?.pid)) {
+      for (const f of [SOCKET, LOCKFILE]) {
+        try {
+          fs.unlinkSync(f);
+        } catch {}
+      }
+    }
+    throw new Error(`unlock failed (${detail})`);
+  }
   return true;
 }
 
@@ -838,7 +889,8 @@ export function register(ctx) {
             if (rest.length > 1) {
               return usage(`unlock takes at most one passkey argument, got ${rest.length}: ${rest.join(" ")}`);
             }
-            await unlock(rest[0], ttl);
+            // Throws on failure; f's dispatcher prints `f: <msg>` and exits 1.
+            if (await unlock(rest[0], ttl)) process.stdout.write("f: unlocked\n");
             break;
           case "lock":
             lock();
@@ -1256,12 +1308,44 @@ export function register(ctx) {
   };
 }
 
-function waitForSocket(p, ms) {
+// Ask a socket whether a *working* daemon owns it. Returns the lockfile state
+// only if the daemon answers `ls`; null if absent, unresponsive, or dead. A
+// socket file on disk is not proof: a dead daemon leaves one behind, and a
+// daemon holding a bad key answers `ls` fine yet fails every `get`.
+async function probeSocket(socketPath) {
+  const lf = readLockfile();
+  if (!lf?.pid || !pidAlive(lf.pid)) return null;
+  try {
+    const r = await Promise.race([
+      daemonCall({ op: "ls" }, socketPath),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), 1500)
+      ),
+    ]);
+    return r?.ok ? unlockedState() : null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolves true only if the socket appeared, false on daemon death or timeout.
+// (The previous version resolved undefined either way, hiding every failure.)
+function waitForSocket(p, ms, child) {
   const start = Date.now();
   return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      resolve(v);
+    };
     const try_ = () => {
-      if (fs.existsSync(p)) return resolve();
-      if (Date.now() - start > ms) return resolve();
+      if (fs.existsSync(p)) {
+        if (child?.exitCode != null) return finish(false); // dead daemon's leftovers
+        return finish(true);
+      }
+      if (child?.exitCode != null) return finish(false);
+      if (Date.now() - start > ms) return finish(false);
       setTimeout(try_, 50);
     };
     try_();
