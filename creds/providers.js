@@ -202,11 +202,26 @@ export async function listProviders() {
     for (const p of discoveryOverride) if (!out.some((x) => x.name === p.name)) out.push(p);
     return out;
   }
+  // Cut the cycle here, at the edge we ourselves cross.
+  //
+  // Discovery spawns `f providers --dump`, which execs each provider's `status`
+  // probe. A provider that reads the creds store from `status` ends up back in
+  // `f creds status`, which calls listProviders(), which dumps again — unbounded.
+  // That is not hypothetical: a configured vaultwarden provider reached ~2,600
+  // live processes from one command.
+  //
+  // Honouring an inherited marker is what makes this terminate, because the
+  // top-level `f providers --dump` has no marker to inherit and stops by
+  // construction (it never calls listProviders).
+  if (process.env.F_CREDS_NO_PROVIDER === "1") return out;
   if (!discovered) {
     discovered = true;
     try {
       const stdout = execFileSync("f", ["providers", "--dump"], {
         encoding: "utf8", timeout: 25_000, stdio: ["ignore", "pipe", "pipe"],
+        // Every provider child inherits this, so any nested discovery attempt
+        // returns early instead of spawning another dump.
+        env: { ...process.env, F_CREDS_NO_PROVIDER: "1" },
       });
       for (const p of fromChildProcess(stdout)) {
         if (!out.some((x) => x.name === p.name)) out.push(p);
