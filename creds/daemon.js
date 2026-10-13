@@ -9,7 +9,7 @@ import path from "node:path";
 
 const argv = process.argv.slice(2);
 const args = {};
-const FLAG_KEYS = ["socket", "lockfile", "ttl", "creds", "salt"];
+const FLAG_KEYS = ["socket", "lockfile", "ttl", "creds", "salt", "expires-at"];
 for (let i = 0; i < argv.length; i++) {
   const k = argv[i].replace(/^--/, "");
   if (FLAG_KEYS.includes(k) && i + 1 < argv.length) {
@@ -109,6 +109,9 @@ const server = net.createServer((socket) => {
         }
         case "set":
           box.entries[req.name] = encValue(key, req.value);
+          // Mirror entries carry an explicit expiry so freshness survives a lock
+          // cycle (the value stays encrypted at rest; only the stamp is plaintext).
+          if (Number.isFinite(req.expiresAt)) box.entries[req.name].expiresAt = req.expiresAt;
           saveCredsBox(box);
           resp = { ok: true };
           break;
@@ -118,8 +121,23 @@ const server = net.createServer((socket) => {
           if (!e) resp = { ok: true, exists: false };
           else {
             const plain = decValue(key, e);
-            resp = { ok: true, exists: true, bytes: plain.length, b64: req.b64 ? b64(plain) : undefined };
+            resp = { ok: true, exists: true, bytes: plain.length, expiresAt: e.expiresAt, b64: req.b64 ? b64(plain) : undefined };
           }
+          break;
+        }
+        // Plaintext metadata only — never the decrypted value. Used by `ls` to
+        // annotate mirrors and by the freshness check.
+        case "meta": {
+          const e = box.entries[req.name];
+          if (!e) resp = { ok: false, error: `no such cred: ${req.name}` };
+          else resp = { ok: true, expiresAt: e.expiresAt };
+          break;
+        }
+        case "clear-expires": {
+          let n = 0;
+          for (const e of Object.values(box.entries)) if (e && "expiresAt" in e) { delete e.expiresAt; n++; }
+          if (n) saveCredsBox(box);
+          resp = { ok: true, count: n };
           break;
         }
         // Bulk write. Each item {name, value}(utf8) or {name, b64}(raw). Stages
@@ -196,6 +214,18 @@ if (!passkey) {
 
 box = loadCredsBox();
 key = deriveKey(passkey, box.salt);
+
+// An unlock refreshes the staleness clock on every mirror: "unlocked for TTL X"
+// now means "the vault was live as of this unlock", so mirrors stay servable for
+// min(mirrorTtl, daemonTtl) without any per-read bookkeeping.
+const EXPIRES_AT = Number(args["expires-at"]);
+if (Number.isFinite(EXPIRES_AT)) {
+  let n = 0;
+  for (const e of Object.values(box.entries)) {
+    if (e && "expiresAt" in e) { e.expiresAt = EXPIRES_AT; n++; }
+  }
+  if (n) saveCredsBox(box);
+}
 
 server.listen(SOCKET, () => {
   fs.writeFileSync(

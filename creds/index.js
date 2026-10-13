@@ -2,6 +2,11 @@
 // key. Unlock spawns a daemon that holds the key in memory and serves ops over a
 // unix socket until TTL expires. Zero deps.
 
+// Provider table (see ./providers.js): every uck that exports a
+// `credentialProvider` is consulted when a name is missing from the box, and the
+// answer is mirrored back in as `mirror:<name>` with a ttl. Local always wins.
+import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryError, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft } from "./providers.js";
+
 import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
@@ -17,6 +22,46 @@ const SOCKET = path.join(F, ".creds.sock");
 const LOCKFILE = path.join(F, ".creds-daemon");
 const DAEMON = path.join(__dirname, "daemon.js");
 const DEFAULT_TTL = 600; // 10 min
+
+/** Mirror entries are vault-sourced and expire; stamp the expiry on store. */
+async function setMirror(name, value, ttlMs, state) {
+  const st = state ?? (await requireUnlocked());
+  const r = await daemonCall(
+    { op: "set", name, value: { b64: Buffer.from(String(value), "utf8").toString("base64") }, expiresAt: Date.now() + ttlMs },
+    st.socket,
+  );
+  if (!r.ok) throw new Error(r.error);
+}
+
+/**
+ * Is mirror:<name> still within its freshness window?
+ *
+ * `ttlSec` is a SECONDS upper bound, never a grant of freshness. The provider's
+ * mirrorTtl is clamped to the daemon's own remaining lifetime, so a mirror is
+ * servable only while the store is unlocked and within the provider's window.
+ * A locked store therefore always counts as stale and forces a provider
+ * round-trip on the next unlock — mirrors never outlive the session that
+ * fetched them. The stored `expiresAt` is rebased to the daemon lifetime on
+ * every unlock (see daemon.js), so this needs no per-read bookkeeping.
+ */
+async function isMirrorFresh(name, ttlSec) {
+  const state = unlockedState();
+  if (!state) return false;
+  const daemonSecsLeft = Math.max(0, Math.floor(state.remainingMs / 1000));
+  const capSec = Math.min(ttlSec, daemonSecsLeft);
+  if (capSec <= 0) return false;
+  const r = await daemonCall({ op: "meta", name: MIRROR_PREFIX + name }, state.socket);
+  if (!r.ok || !Number.isFinite(r.expiresAt)) return false;
+  return Date.now() < r.expiresAt;
+}
+
+/** Read a raw cred without touching providers (used by the resolver itself). */
+async function rawGet(name, state) {
+  const st = state ?? unlockedState();
+  if (!st) return null;
+  const r = await daemonCall({ op: "get", name }, st.socket);
+  return r.ok ? r.value : null;
+}
 
 function ensureFDir() {
   fs.mkdirSync(F, { recursive: true });
@@ -194,7 +239,8 @@ async function unlock(passkeyArg, ttl) {
     return false;
   }
   // Spawn daemon detached; passkey via stdin (not argv).
-  const child = spawn(process.execPath, [DAEMON, "--socket", SOCKET, "--lockfile", LOCKFILE, "--ttl", String(ttl ?? DEFAULT_TTL), "--creds", CREDS], {
+  const expiresAt = Date.now() + (ttl ?? DEFAULT_TTL) * 1000;
+  const child = spawn(process.execPath, [DAEMON, "--socket", SOCKET, "--lockfile", LOCKFILE, "--ttl", String(ttl ?? DEFAULT_TTL), "--creds", CREDS, "--expires-at", String(expiresAt)], {
     detached: true,
     stdio: ["pipe", "ignore", "ignore"],
   });
@@ -580,16 +626,32 @@ async function wait(name, { timeout = 300000, pollMs = 500, onPoll, by } = {}) {
 export function register(ctx) {
   return {
     name: "creds",
-    desc: "store credentials (scrypt+AES-GCM, daemon+socket, ttl)",
+    desc: "store credentials (scrypt+AES-GCM, daemon+socket, ttl); falls back to credential providers on a miss",
     skills: [{ name: "f-creds", path: path.join(__dirname, "SKILL.md") }],
+    /** Let another uck plug a remote secret store in behind `f creds get`.
+     *  See ./providers.js for the interface. Registration is process-local —
+     *  providers are normally discovered from each uck's `credentialProvider`
+     *  export via `f providers --dump` instead. */
+    registerProvider,
     // Programmatic entry for other ucks.
     credsApi: {
       async get(name, ttl) {
         const state = unlockedState();
         if (!state) throw new Error("creds locked");
         const r = await daemonCall({ op: "get", name }, state.socket);
-        if (!r.ok) throw new Error(r.error);
-        return r.value;
+        if (r.ok && r.value != null && r.value !== "") return r.value;
+        // A sibling uck asking for a cred gets the same provider ladder the CLI
+        // gives, so `f fj` / `f gh` pick up vault-backed creds for free. A lock
+        // is still a lock: never do provider traffic (or prompt) from here.
+        const res = await resolveViaProvider(name, {
+          getCred: (k) => rawGet(k, state),
+          setMirror: (k, v, t) => setMirror(k, v, t, state),
+          isFresh: (n, t) => isMirrorFresh(n, t),
+        });
+        if (res.value != null) return res.value;
+        if (res.error) throw new Error(`provider '${res.provider}' failed: ${res.error}`);
+        if (res.none) throw new Error(r.error ?? `no such cred: ${name}`);
+        throw new Error(r.error ?? `no such cred: ${name} (no provider has it)`);
       },
       async set(name, value) {
         const state = unlockedState();
@@ -623,6 +685,43 @@ export function register(ctx) {
       },
       unlock,
       lock,
+      /** Resolve a name exactly as `f creds get` does, with provenance.
+       *  opts: { localOnly, forceProvider, noCache }. Returns
+       *  { value, source, warning? } or throws. Use this from a uck that needs
+       *  to report where a token came from. */
+      async resolve(name, opts = {}) {
+        const state = unlockedState();
+        if (!state) throw new Error("creds locked");
+        if (opts.noCache) clearMisses(name);
+        if (!opts.localOnly && !opts.forceProvider) {
+          const r = await daemonCall({ op: "get", name }, state.socket);
+          if (r.ok && r.value != null && r.value !== "") return { value: r.value, source: `local:${name}` };
+        }
+        if (opts.forceProvider || !opts.localOnly) {
+          const res = await resolveViaProvider(name, {
+            getCred: (k) => rawGet(k, state),
+            setMirror: (k, v, t) => setMirror(k, v, t, state),
+            isFresh: (n, t) => (opts.forceProvider ? async () => false : (n2, t2) => isMirrorFresh(n2, t2)),
+          });
+          if (res.value != null) return { value: res.value, source: res.mirror ? `vault (${res.mirror})` : `${res.provider}:${name}`, warning: res.warning };
+          if (res.error) throw new Error(`provider '${res.provider}' failed: ${res.error}`);
+          if (res.none) throw new Error(`no such cred: ${name} (${res.note})`);
+        }
+        throw new Error(`no such cred: ${name}`);
+      },
+      /** Providers visible to creds, with { name, ready, note? }. */
+      async providers() {
+        const out = [];
+        for (const p of await listProviders()) {
+          let ready = null;
+          let note;
+          if (typeof p.status === "function") {
+            try { const st = await p.status(); ready = !!st?.ready; note = st?.note; } catch (e) { note = e?.message ?? String(e); }
+          }
+          out.push({ name: p.name, ready, note });
+        }
+        return out;
+      },
       status: () => {
         const s = unlockedState();
         return s ? { unlocked: true, remainingMs: s.remainingMs } : { unlocked: false };
@@ -638,6 +737,11 @@ export function register(ctx) {
       let outDir = null;
       let asStdin = null;
       let jsonOut = false;
+      let localOnly = false;      // --local: never consult providers
+      let forceProvider = false;  // --vault: bypass local + mirror, ask providers now
+      let showSource = false;     // --source: print provenance alongside the value
+      let noCache = false;        // --no-cache: ignore + clear the negative cache
+      let showAll = false;        // --all (ls): include provider mirrors
       const a = [...(args._ ?? [])];
       for (let i = 0; i < a.length; i++) {
         if (a[i] === "--ttl") {
@@ -658,6 +762,16 @@ export function register(ctx) {
           i++;
         } else if (a[i] === "--json") {
           jsonOut = true;
+        } else if (a[i] === "--local") {
+          localOnly = true;
+        } else if (a[i] === "--vault") {
+          forceProvider = true;
+        } else if (a[i] === "--source") {
+          showSource = true;
+        } else if (a[i] === "--all") {
+          showAll = true;
+        } else if (a[i] === "--no-cache") {
+          noCache = true;
         } else pos.push(a[i]);
       }
       const redact = (value) =>
@@ -675,17 +789,101 @@ export function register(ctx) {
           case "status": {
             const s = unlockedState();
             process.stdout.write(s ? `unlocked (${fmt(s.remainingMs)} left)\n` : "locked\n");
+            // Providers are part of the answer now: a missing cred may be living
+            // in a vault the local store has never seen.
+            try {
+              const provs = await listProviders();
+              const enabled = provs.filter((p) => p.name);
+              if (!enabled.length) {
+                process.stdout.write("providers: none\n");
+                if (providerDiscoveryError()) process.stdout.write(`providers: discovery failed (${providerDiscoveryError()})\n`);
+              } else {
+                for (const p of enabled) {
+                  let note = "";
+                  if (typeof p.status === "function") {
+                    try {
+                      const st = await p.status();
+                      note = ` — ${st?.ready ? "ready" : "not ready"}${st?.note ? `: ${st.note}` : ""}`;
+                      if (st?.hint) note += `\n  hint: ${st.hint}`;
+                    } catch (e) { note = ` — status failed: ${e?.message ?? e}`; }
+                  }
+                  process.stdout.write(`providers: ${p.name}${note}\n`);
+                }
+              }
+            } catch (e) {
+              process.stdout.write(`providers: probe failed (${e?.message ?? e})\n`);
+            }
             break;
           }
           case "set": {
             const [name, ...valParts] = rest;
             if (!name || valParts.length === 0) return usage("set requires <name> <value>");
+            if (isMirrorKey(name)) return usage(`'${MIRROR_PREFIX}\u2026' is reserved for provider mirrors — drop the prefix`);
             await op("set", { name, value: valParts.join(" ") });
+            // An explicit local value supersedes any mirror of the same name.
+            if (!forceProvider) { try { await op("rm", { name: MIRROR_PREFIX + name }); } catch {}
+            }
+            clearMisses(name);
             break;
           }
           case "get": {
-            const r = await op("get", { name: rest[0] });
-            if (r.value != null) process.stdout.write(redact(r.value) + "\n");
+            const name = rest[0];
+            if (!name) return usage("get requires <name>");
+            if (noCache) clearMisses(name);
+            const state = await requireUnlocked();
+            let value = null;
+            let src = `local:${name}`;
+
+            if (forceProvider) {
+              // --vault: skip local and mirror entirely, revalidate against the provider.
+              const r = await resolveViaProvider(name, { getCred: (k) => rawGet(k, state), setMirror: (k, v, t) => setMirror(k, v, t, state), isFresh: () => false });
+              if (r.none) { process.stderr.write(`f: ${r.note}\n`); process.exit(1); }
+              if (r.error) { process.stderr.write(`f: provider '${r.provider}' failed: ${r.error}\n`); process.exit(1); }
+              if (r.miss) { process.stderr.write(`f: no provider has '${name}'\n`); process.exit(1); }
+              value = r.value;
+              src = `${r.provider}:${name}${r.mirrored ? " (mirrored)" : ""}`;
+            } else {
+              const direct = await daemonCall({ op: "get", name }, state.socket);
+              if (direct.ok && direct.value != null && direct.value !== "") {
+                value = direct.value;
+              } else {
+                // Local miss -> provider ladder (mirror ttl, negative cache).
+                const r = await resolveViaProvider(name, { getCred: (k) => rawGet(k, state), setMirror: (k, v, t) => setMirror(k, v, t, state), isFresh: (n, t) => isMirrorFresh(n, t) });
+                if (r.none) {
+                  // No providers at all: preserve the classic error exactly.
+                  process.stderr.write(`f: ${direct.error ?? `no such cred: ${name}`}\n`);
+                  process.exit(1);
+                }
+                if (r.error) { process.stderr.write(`f: provider '${r.provider}' failed: ${r.error}\n`); process.exit(1); }
+                if (r.miss) { process.stderr.write(`f: no such cred: ${name} (no provider has it either)\n`); process.exit(1); }
+                value = r.value;
+                src = r.mirror ? `vault:${mirrorName(MIRROR_PREFIX + name)} (${r.mirror}${r.warning ? ", " + r.warning : ""})`
+                  : `${r.provider}:${name}${r.mirrored ? " (mirrored)" : ""}`;
+                if (r.warning) process.stderr.write(`f: ${r.warning}\n`);
+              }
+            }
+
+            if (value != null) process.stdout.write(redact(value) + "\n");
+            if (showSource) process.stderr.write(`f: source: ${src}\n`);
+            break;
+          }
+          case "forget": {
+            // Drop the mirror(s) + negative cache for a name so the next get
+            // revalidates. Does not touch real local creds.
+            const names = rest.length ? rest : null;
+            if (noCache || !names) clearMisses();
+            const state = await requireUnlocked();
+            if (!names) {
+              const r = await daemonCall({ op: "ls" }, state.socket);
+              for (const n of (r.names ?? []).filter(isMirrorKey)) { try { await op("rm", { name: n }); } catch {}
+              }
+              break;
+            }
+            for (const n of names) {
+              const key = isMirrorKey(n) ? n : MIRROR_PREFIX + n;
+              try { await op("rm", { name: key }); process.stdout.write(`forgot\t${key}\n`); } catch { process.stdout.write(`no mirror\t${n}\n`); }
+              clearMisses(n);
+            }
             break;
           }
           case "request": {
@@ -741,7 +939,35 @@ export function register(ctx) {
           }
           case "ls": {
             const r = await op("ls", {});
-            for (const n of r.names ?? []) process.stdout.write(n + "\n");
+            // Providers may add names beyond what the box holds. Default view
+            // keeps mirrors out of the noise (they are a cache, not creds);
+            // --all shows them with expiry.
+            const names = new Set(r.names ?? []);
+            const mirrors = [...names].filter(isMirrorKey);
+            for (const m of mirrors) names.delete(m);
+            const extra = new Set();
+            if (!localOnly) {
+              try {
+                for (const p of await listProviders()) {
+                  if (typeof p.list !== "function") continue;
+                  for (const n of (await p.list()) ?? []) if (!names.has(n)) extra.add(n);
+                }
+              } catch { /* provider listing is advisory */ }
+            }
+            for (const n of [...names].sort()) process.stdout.write(n + "\n");
+            for (const n of [...extra].sort()) process.stdout.write(`${n}\t(provider)\n`);
+            if (jsonOut || showAll) {
+              for (const m of mirrors.sort()) {
+                let exp = "no expiry";
+                try {
+                  const meta = await daemonCall({ op: "meta", name: m }, state.socket);
+                  if (meta?.ok && Number.isFinite(meta.expiresAt)) exp = `expires ${new Date(meta.expiresAt).toISOString()}`;
+                } catch { /* metadata is advisory */ }
+                process.stdout.write(`${m}\t(mirror; ${exp})\n`);
+              }
+            } else if (mirrors.length) {
+              process.stdout.write(`(${mirrors.length} provider mirror(s) hidden — --all)\n`);
+            }
             break;
           }
           case "files": {
@@ -810,9 +1036,18 @@ function usage(msg) {
       "  unlock [passkey] [--ttl sec]   start daemon; --ttl accepts s/m/h/d/w\n" +
       "                                    (e.g. 900, 45m, 2h, 1d, 1d6h30m; default 10m)\n" +
       "  lock                            stop daemon, zeroize key\n" +
-      "  status                          locked / unlocked + time left\n" +
-      "  set <name> <value>              store a cred\n" +
-      "  get <name> [--secrets]          print a cred (redacted without --secrets)\n" +
+      "  status                          locked / unlocked + time left, + provider readiness\n" +
+      "  set <name> <value>              store a cred (also clears that name's mirror)\n" +
+      "  get <name> [--secrets]          print a cred (redacted without --secrets);\n" +
+      "                                    on a local miss, consult credential\n" +
+      "                                    providers and mirror the hit\n" +
+      "    --local                          never consult providers\n" +
+      "    --vault                          skip local + mirror, revalidate with the\n" +
+      "                                     provider now (refuses to serve a stale mirror)\n" +
+      "    --source                         print provenance to stderr\n" +
+      "    --no-cache                       ignore/clear the negative cache first\n" +
+      "  forget [name...]                drop provider mirror(s) + negative cache\n" +
+      "                                    (no args = all mirrors)\n" +
       "  request <name> [--timeout sec]  block until the cred is set elsewhere,\n" +
       "                                    then print it (default 300s; also waits\n" +
       "                                    for unlock if the daemon is locked;\n" +
@@ -821,7 +1056,8 @@ function usage(msg) {
       "                                    terminals' f fj / ucks that are blocked)\n" +
       "  fill [name]                     prompt + set value(s) for the open\n" +
       "                                    waiters (or just <name>); unblocks them\n" +
-      "  ls                              list names (secrets + file:<path> keys + 'files')\n" +
+      "  ls [--all]                      list names; mirrors hidden unless --all\n" +
+      "                                    (mirror:<name> = provider-sourced, expires)\n" +
       "  rm <name>                       remove a cred\n" +
       "  files <sub>                     packed files (key = file:<abs path> + 'files' manifest)\n" +
       "    ls [--json]                       list packed files (terse, or raw manifest JSON)\n" +
