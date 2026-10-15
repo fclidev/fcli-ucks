@@ -7,6 +7,9 @@ description: Store and use credentials via `f creds` (scrypt+AES-GCM, daemon+soc
 
 Encrypted credential store (scrypt+AES-GCM). A local daemon holds the key in memory; commands talk to it over a socket. Never write secrets to env vars, files, or command output.
 
+> **Full command table, and the provider interface contract for uck authors:
+> [`README.md`](./README.md).** This file is the operational guide.
+
 ## Commands
 
 ```
@@ -47,13 +50,16 @@ wrong:
 - **A locked box is not "empty".** While locked, `getCred` returns null for every
   key, so the provider is skipped entirely rather than called and then unable to
   save its answer.
-- **Unknown names are cached briefly** (default 300s) so a typo does not hammer
-  the server on every invocation; `--clear-misses` resets it.
+- **Unknown names are cached briefly** (default 300s, `missTtlSec`) so a typo does not
+  hammer the server on every invocation. `--no-cache` resets one name; `f creds forget`
+  clears them.
 - **Mirrors are copies of secrets.** `f creds rm mirror:<name>` is a real secret
   deletion, and `f creds ls` shows them.
-- **Source affinity**: a mirror records which provider produced it, so a
-  multi-provider setup does not serve a stale Vaultwarden value where a local one
-  was expected.
+- **Source affinity**: a mirror records which provider produced it, so a multi-provider
+  setup does not serve a stale Vaultwarden value where a local one was expected.
+- **A stale mirror is served with a warning, never silently** — and a provider *miss*
+  never updates or deletes vault-sourced content. Only a live hit refreshes a mirror, so
+  an outage cannot erase what the vault once gave you.
 
 Config lives in `f.config.json` under `providers` (`enabled`, `mirrorTtlSec`,
 `missTtlSec`, per-provider overrides). See the `f-vaultwarden` skill for the
@@ -83,10 +89,39 @@ export function register(_ctx) {
 }
 ```
 
-Do **not** implement `has()` unless you can answer it without the network: a
-pre-filter that says "not mine" is cached and suppresses `resolve()` entirely.
-Discovery is `f providers --dump`, so provider code runs in every `f` process —
-keep module scope side-effect free and do no work until called.
+The full interface — all six fields and why each exists — is in
+[`README.md`](./README.md). The contract in one table:
+
+| `resolve(name)` returns | means | the user sees |
+|---|---|---|
+| `string` / `Buffer` | a hit | the value, mirrored as `mirror:<name>` |
+| `null` / `undefined` / `""` | "this name is **not mine**" | next provider, then a clean `no such cred` |
+| **throws** | broken: locked, offline, wrong password, misconfigured | the error, verbatim, exit non-zero |
+
+Discovery accepts only objects with `name: string` **and** `resolve: function`.
+`status()` must report `{ ready, note?, hint? }`; `mirrorTtlSec` is a **floor**, clamped
+to the daemon's remaining unlocked lifetime so no mirror outlives the session that
+fetched it (`0` = revalidate always).
+
+> `blurb` is read by **nothing** — `f providers` builds output from `{ name, ready,
+> note }`. Anything the operator must see goes in `status().note`.
+
+Do **not** implement `has()` unless you can answer it without the network: it is a
+pre-filter consulted *before* `resolve`, its answer is cached, and a "not mine" from a
+timeout makes the provider look empty rather than broken. Omitting `has` entirely is
+always safe — the ladder then just calls `resolve()`.
+
+Discovery is `f providers --dump`, so provider module code runs in every `f` process,
+including ones doing unrelated work: keep module scope side-effect free, do nothing until
+called, and **never block on a passphrase** (throw instead — the caller is already gated
+on `f creds unlock`).
+
+**Recursion is the sharp edge.** A provider that reads through `f creds` can call
+itself. `f creds` sets `F_CREDS_NO_PROVIDER=1` in the environment of children it spawns
+for provider work; pass it through if you shell out. Read the flag's real semantics in
+`providers.js` before inventing your own marker — vaultwarden once self-suppressed on
+`list`, which silently cost a full prelogin + sync + PBKDF2 per credential lookup.
+Secrets never go in argv: providers are spawned, so argv is visible in `ps`.
 
 ## Packed files (`f creds files …`)
 
