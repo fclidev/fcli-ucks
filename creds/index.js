@@ -5,7 +5,7 @@
 // Provider table (see ./providers.js): every uck that exports a
 // `credentialProvider` is consulted when a name is missing from the box, and the
 // answer is mirrored back in as `mirror:<name>` with a ttl. Local always wins.
-import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryError, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft } from "./providers.js";
+import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryError, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource } from "./providers.js";
 
 import net from "node:net";
 import fs from "node:fs";
@@ -941,7 +941,7 @@ export function register(ctx) {
             const r = await op("ls", {});
             // Providers may add names beyond what the box holds. Default view
             // keeps mirrors out of the noise (they are a cache, not creds);
-            // --all shows them with expiry.
+            // --all shows them with their producing provider and expiry.
             const names = new Set(r.names ?? []);
             const mirrors = [...names].filter(isMirrorKey);
             for (const m of mirrors) names.delete(m);
@@ -954,20 +954,67 @@ export function register(ctx) {
                 }
               } catch { /* provider listing is advisory */ }
             }
-            for (const n of [...names].sort()) process.stdout.write(n + "\n");
-            for (const n of [...extra].sort()) process.stdout.write(`${n}\t(provider)\n`);
+            // Provenance is a property of the cache entry, and it is already
+            // recorded (src:<key> in the miss cache, written by setMirrorSource
+            // when the provider hit). Read it rather than guessing: the box does
+            // NOT record how a plain cred got there, so local values are labelled
+            // `local` and nothing more — claiming more would be invention.
+            const rows = [];
+            for (const n of [...names].sort()) rows.push({ name: n, source: "local" });
+            for (const n of [...extra].sort()) rows.push({ name: n, source: "provider" });
+            let hidden = 0;
             if (jsonOut || showAll) {
               for (const m of mirrors.sort()) {
-                let exp = "no expiry";
+                let exp = null;
+                // `state.socket`, not `state.socket`: `state` exists only inside
+                // op()/requireUnlocked(), so this free variable threw
+                // ReferenceError on EVERY mirror. The surrounding `catch` swallowed
+                // it, so mirror expiry silently never displayed — the feature read
+                // as "no expiry" forever and nothing complained. op("ls") above
+                // already proved the store is unlocked, so the SOCKET default is
+                // exactly what every other call-site resolves to.
                 try {
-                  const meta = await daemonCall({ op: "meta", name: m }, state.socket);
-                  if (meta?.ok && Number.isFinite(meta.expiresAt)) exp = `expires ${new Date(meta.expiresAt).toISOString()}`;
+                  const meta = await daemonCall({ op: "meta", name: m });
+                  if (meta?.ok && Number.isFinite(meta.expiresAt)) exp = new Date(meta.expiresAt).toISOString();
                 } catch { /* metadata is advisory */ }
-                process.stdout.write(`${m}\t(mirror; ${exp})\n`);
+                let provider = null;
+                try { provider = mirrorSource(m); } catch { /* advisory */ }
+                rows.push({
+                  name: m,
+                  source: provider ? `mirror:${provider}` : "mirror",
+                  provider,
+                  expiresAt: exp,
+                });
               }
             } else if (mirrors.length) {
-              process.stdout.write(`(${mirrors.length} provider mirror(s) hidden — --all)\n`);
+              hidden = mirrors.length;
             }
+            if (jsonOut) {
+              // Real JSON. The flag previously set jsonOut and never read it, so
+              // `ls --json` printed the same line-oriented text as plain `ls` —
+              // and a caller piping to a parser got a bare name per line, with no
+              // way to tell a mirror from a local cred.
+              process.stdout.write(JSON.stringify(rows.map((r2) => {
+                const o = { name: r2.name, source: r2.source };
+                if (r2.provider) o.provider = r2.provider;
+                if (r2.expiresAt) o.expiresAt = r2.expiresAt;
+                return o;
+              }), null, 2) + "\n");
+              break;
+            }
+            for (const row of rows) {
+              if (row.source === "local") { process.stdout.write(row.name + "\n"); continue; }
+              const bits = [];
+              if (row.source === "provider") { process.stdout.write(`${row.name}\t(provider)\n`); continue; }
+              if (row.provider) bits.push(row.provider);
+              bits.push(row.expiresAt ? `expires ${row.expiresAt}` : "no expiry");
+              process.stdout.write(`${row.name}\t(mirror; ${bits.join("; ")})\n`);
+            }
+            // The count line is the ALTERNATIVE to listing mirrors, never an
+            // addition to it. It used to print here after the rows were already
+            // emitted — and because it sat in an `else if` whose branch also
+            // `break`s, `--all` printed a count and then nothing at all.
+            if (hidden) process.stdout.write(`(${hidden} provider mirror(s) hidden — --all)\n`);
             break;
           }
           case "files": {
@@ -1056,8 +1103,9 @@ function usage(msg) {
       "                                    terminals' f fj / ucks that are blocked)\n" +
       "  fill [name]                     prompt + set value(s) for the open\n" +
       "                                    waiters (or just <name>); unblocks them\n" +
-      "  ls [--all]                      list names; mirrors hidden unless --all\n" +
-      "                                    (mirror:<name> = provider-sourced, expires)\n" +
+      "  ls [--all|--json]              list names; mirrors hidden unless --all\n" +
+      "                                    mirrors show their provider + expiry;\n" +
+      "                                    --json emits [{name, source, …}]\n" +
       "  rm <name>                       remove a cred\n" +
       "  files <sub>                     packed files (key = file:<abs path> + 'files' manifest)\n" +
       "    ls [--json]                       list packed files (terse, or raw manifest JSON)\n" +
