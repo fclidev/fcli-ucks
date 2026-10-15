@@ -59,7 +59,7 @@ async function isMirrorFresh(name, ttlSec) {
 async function rawGet(name, state) {
   const st = state ?? unlockedState();
   if (!st) return null;
-  const r = await daemonCall({ op: "get", name }, st.socket);
+  const r = await daemonCall({ op: "get", name }, SOCKET);
   return r.ok ? r.value : null;
 }
 
@@ -778,7 +778,12 @@ export function register(ctx) {
         showSecrets ? String(value) : `[redacted — pass --secrets to reveal]`;
       const [cmd, ...rest] = pos;
 
-      (async () => {
+      // Returned, not fired-and-forgotten. An unawaited floating IIFE means the
+      // caller cannot know when a command finished (a test driver had to poll for
+      // it), and a rejection after the first tick is an unhandled rejection that
+      // Node turns into a nonzero exit with a stack, not a message. Callers that
+      // ignore the promise behave exactly as before.
+      return (async () => {
         switch (cmd) {
           case "unlock":
             await unlock(rest[0], ttl);
@@ -821,7 +826,15 @@ export function register(ctx) {
             if (isMirrorKey(name)) return usage(`'${MIRROR_PREFIX}\u2026' is reserved for provider mirrors — drop the prefix`);
             await op("set", { name, value: valParts.join(" ") });
             // An explicit local value supersedes any mirror of the same name.
-            if (!forceProvider) { try { await op("rm", { name: MIRROR_PREFIX + name }); } catch {}
+            // NOT via op(): op() calls process.exit(1) on a missing entry, and a
+            // process.exit inside `try { await op(...) } catch {}` is uncatchable
+            // — the command died with `no such cred: mirror:<name>` AFTER the set
+            // had already succeeded, so every plain `f creds set <name>` of a name
+            // with no mirror exited 1 while doing exactly what was asked. Ask the
+            // daemon directly and treat "no mirror" as the normal case.
+            if (!forceProvider) {
+              const st = await requireUnlocked();
+              await daemonCall({ op: "rm", name: MIRROR_PREFIX + name }, st.socket).catch(() => {});
             }
             clearMisses(name);
             break;
@@ -875,13 +888,27 @@ export function register(ctx) {
             const state = await requireUnlocked();
             if (!names) {
               const r = await daemonCall({ op: "ls" }, state.socket);
-              for (const n of (r.names ?? []).filter(isMirrorKey)) { try { await op("rm", { name: n }); } catch {}
+              // daemonCall, not op(): op() process.exit(1)s on a missing entry and
+              // that is uncatchable, so a mirror deleted underneath us by expiry
+              // would abort the whole sweep.
+              for (const n of (r.names ?? []).filter(isMirrorKey)) {
+                await daemonCall({ op: "rm", name: n }, state.socket).catch(() => {});
               }
               break;
             }
             for (const n of names) {
               const key = isMirrorKey(n) ? n : MIRROR_PREFIX + n;
-              try { await op("rm", { name: key }); process.stdout.write(`forgot\t${key}\n`); } catch { process.stdout.write(`no mirror\t${n}\n`); }
+              // Ask before deleting, then report by the NAME the operator used.
+              // Deleting blind and catching was doubly wrong: op()'s process.exit
+              // is uncatchable, and the failure path printed the internal
+              // `mirror:<name>` key, which is not a name anyone typed.
+              const exists = (await daemonCall({ op: "has", name: key }, state.socket).catch(() => ({ exists: false })))?.exists;
+              if (exists) {
+                await daemonCall({ op: "rm", name: key }, state.socket).catch(() => {});
+                process.stdout.write(`forgot\t${n}\n`);
+              } else {
+                process.stdout.write(`no mirror\t${n}\n`);
+              }
               clearMisses(n);
             }
             break;
@@ -1049,7 +1076,93 @@ export function register(ctx) {
             await unpack(rest, { force, dir: outDir ? path.resolve(outDir) : null });
             break;
           case "rm": {
-            await op("rm", { name: rest[0] });
+            const [nm] = rest;
+            if (!nm) return usage("rm needs <name>");
+            {
+              const st = await requireUnlocked();
+              const localKey = isMirrorKey(nm) ? null : nm;
+              const mirrorKey = isMirrorKey(nm) ? nm : MIRROR_PREFIX + nm;
+              const localR = localKey ? await daemonCall({ op: "has", name: localKey }, SOCKET).catch(() => ({ exists: false })) : { exists: false };
+              const mirrorR = await daemonCall({ op: "has", name: mirrorKey }, SOCKET).catch(() => ({ exists: false }));
+
+              if (!localR?.exists && !mirrorR?.exists) {
+                // Say what IS true rather than the bare 'no such cred' that made a
+                // failed delete indistinguishable from 'never existed'.
+                process.stderr.write(`f: no such cred: ${nm}\n  nothing in the box and no mirror under ${mirrorKey}\n  (a provider may still answer for it — check: f creds has ${nm})\n`);
+                process.exitCode = 1;
+                break;
+              }
+              let removedLocal = false, removedMirror = false;
+              if (localR?.exists) { await op("rm", { name: localKey }); removedLocal = true; }
+              // daemonCall, not op(): op() process.exit(1)s internally, which no
+              // .catch() can intercept, so the follow-up notes below would never
+              // print and the command would look like a failed delete.
+              if (mirrorR?.exists) {
+                await daemonCall({ op: "rm", name: mirrorKey }, st.socket).catch(() => {});
+                removedMirror = true;
+              }
+              if (removedLocal) process.stdout.write(`removed\t${nm}\n`);
+              if (removedMirror) {
+                const prov = mirrorSource(mirrorKey);
+                process.stdout.write(`removed\t${mirrorKey}${prov ? `\t(mirror of ${prov})` : ""}\n`);
+                // The thing an operator needs to hear: the provider still serves this.
+                process.stdout.write(`note\tthis only dropped the local cache — ${prov ?? "the provider"} still answers for '${nm}'; the next get re-mirrors it\n`);
+                process.stdout.write(`note\tto stop it resolving, remove or rename it at the source${prov === "vaultwarden" ? ` (f vaultwarden has no delete yet: do it in the web vault)` : ""}\n`);
+              }
+            }
+            break;
+          }
+          case "has": {
+            // Documented in USAGE since before this case existed: `has` fell
+            // through to `default: usage()` and exited 1. The daemon op was there
+            // the whole time — only the CLI route was missing, which is why the
+            // mirror/cred distinction below was impossible to ask about.
+            const nm = rest[0];
+            if (!nm) return usage("has needs <name>");
+            {
+              await requireUnlocked();
+              const r = await daemonCall({ op: "has", name: nm }, SOCKET);
+              const mirrorKey = isMirrorKey(nm) ? nm : MIRROR_PREFIX + nm;
+              const mirrorR = isMirrorKey(nm) ? r : await daemonCall({ op: "has", name: mirrorKey }, SOCKET).catch(() => ({ exists: false }));
+              const src = !isMirrorKey(nm) && r?.exists ? "local"
+                : (r?.exists || mirrorR?.exists) ? (mirrorSource(mirrorKey) ?? "mirror")
+                : null;
+              if (r?.exists) {
+                process.stdout.write(`exists\t${nm}\tlocal${Number.isFinite(r.expiresAt) ? `\texpires ${new Date(r.expiresAt).toISOString()}` : ""}\n`);
+              } else if (mirrorR?.exists) {
+                const prov = mirrorSource(mirrorKey);
+                process.stdout.write(`exists\t${nm}\tmirror${prov ? `:${prov}` : ""}${Number.isFinite(mirrorR.expiresAt) ? `\texpires ${new Date(mirrorR.expiresAt).toISOString()}` : ""}\n`);
+              } else {
+                process.stdout.write(`absent\t${nm}\n`);
+                process.exitCode = 1;
+              }
+              // Naming what a bare `rm` would actually touch, so the mirror/cred
+              // distinction is answerable before deleting something.
+              if (src) {
+                // Naming what a bare `rm` would actually touch, so the mirror/cred
+                // distinction is answerable BEFORE deleting something. For a local
+                // value there is nothing to hedge: rm removes it, full stop.
+                const hint = src === "local"
+                  ? `f: rm ${nm} removes the local value (no provider mirror involved)`
+                  : `f: rm ${nm} removes only the mirror cache${src.startsWith("mirror:") ? ` (from ${src.slice(8)})` : ""} — the provider still answers for it`;
+                process.stderr.write(hint + "\n");
+              }
+            }
+            break;
+          }
+          case "meta": {
+            const nm = rest[0];
+            if (!nm) return usage("meta needs <name>");
+            {
+              await requireUnlocked();
+              const r = await daemonCall({ op: "meta", name: nm }, SOCKET);
+              if (!r?.ok) { process.stderr.write(`f: no such cred: ${nm}\n`); process.exitCode = 1; break; }
+              const prov = isMirrorKey(nm) ? mirrorSource(nm) : mirrorSource(MIRROR_PREFIX + nm);
+              const kind = isMirrorKey(nm) ? `mirror${prov ? `:${prov}` : ""}` : (prov && prov !== "local" ? `local (mirror of ${prov} also exists)` : "local");
+              process.stdout.write(`name\t${nm}\nkind\t${kind}\n`);
+              if (Number.isFinite(r.expiresAt)) process.stdout.write(`expiresAt\t${new Date(r.expiresAt).toISOString()}\n`);
+              else process.stdout.write("expiresAt\t(never)\n");
+            }
             break;
           }
           default:
@@ -1103,10 +1216,12 @@ function usage(msg) {
       "                                    terminals' f fj / ucks that are blocked)\n" +
       "  fill [name]                     prompt + set value(s) for the open\n" +
       "                                    waiters (or just <name>); unblocks them\n" +
-      "  ls [--all|--json]              list names; mirrors hidden unless --all\n" +
+      "  ls [--all|--json]               list names; mirrors hidden unless --all\n" +
       "                                    mirrors show their provider + expiry;\n" +
       "                                    --json emits [{name, source, …}]\n" +
-      "  rm <name>                       remove a cred\n" +
+      "  rm <name>                       remove a cred; if <name> is only a provider\n" +
+      "                                    mirror, drops the cache and says the\n" +
+      "                                    provider still answers for it\n" +
       "  files <sub>                     packed files (key = file:<abs path> + 'files' manifest)\n" +
       "    ls [--json]                       list packed files (terse, or raw manifest JSON)\n" +
       "    pack <path>... [opts]             store files\n" +
