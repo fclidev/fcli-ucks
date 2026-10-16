@@ -97,6 +97,9 @@ export async function collect({ verbose } = {}) {
       uck: u.name,
       entry: u.entry,
       hasExternalApi: true,
+      // Advertised by the provider's credentialProvider; gates `creds set` dual-write.
+      // Must be copied here — dropping it makes every provider look read-only to `set`.
+      canWrite: p.canWrite === true,
       mirrorTtlSec: typeof p.mirrorTtlSec === "number" ? p.mirrorTtlSec : undefined,
     });
   }

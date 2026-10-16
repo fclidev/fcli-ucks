@@ -95,6 +95,80 @@ async function rawGet(name, state) {
   return r.ok ? r.value : null;
 }
 
+/**
+ * Resolve one cred name for a *program* — a uck, not a human.
+ *
+ * Why this exists as its own entry point: reading the box over the raw socket
+ * (the cheap way) only sees names that were actually `set` locally. A cred that
+ * lives in a provider — Vaultwarden and friends — exists locally ONLY as the
+ * `mirror:<name>` entry, under a different key and a TTL, so a socket `get` of
+ * the plain name misses and the uck concludes the credential does not exist.
+ * `f ha` and `f gh` were silently broken exactly that way while `f fj` worked,
+ * purely because its token happened to be stored locally.
+ *
+ * Order: local name -> provider ladder (which serves a fresh mirror without any
+ * network round trip) -> the raw `mirror:<name>` entry as a last resort. That
+ * last step is what makes a vault-backed cred resolvable while the provider is
+ * down, which the ladder refuses to do on its own (it reports the mirror stale).
+ *
+ * Returns { value, source } | { error } | { missing } | { locked }.
+ * Never prints anything: the value only ever goes to the caller in memory.
+ */
+export async function lookupCred(name, opts = {}) {
+  const state = unlockedState();
+  if (!state) return { locked: true };
+
+  if (!opts.forceProvider) {
+    const local = await daemonCall({ op: "get", name }, state.socket);
+    if (local.ok && local.value != null && local.value !== "") {
+      // Never report a mirror entry as a local cred, even when asked for by its
+      // prefixed key: the value is the provider's, its expiry is the provider's,
+      // and `local:` tells the operator the box is authoritative when it is not.
+      // No staleness judgement here on purpose. Freshness is a function of the
+      // provider's TTL and the daemon's own remaining life, and `isMirrorFresh`
+      // is the single place that computes it — called below, via the ladder. A
+      // guess here would be a second, weaker copy of that rule.
+      const mirrored = isMirrorKey(name);
+      return { value: local.value, source: mirrored ? `mirror (${name.slice(MIRROR_PREFIX.length)})` : `local:${name}` };
+    }
+  }
+
+  if (!opts.localOnly) {
+    const res = await resolveViaProvider(name, {
+      getCred: (k) => rawGet(k, state),
+      setMirror: (k, v, t) => setMirror(k, v, t, state),
+      isFresh: (n, t) => (opts.forceProvider ? async () => false : isMirrorFresh),
+    });
+    if (res.value != null) {
+      // A stale mirror is still the answer, but say so — callers print `source`.
+      return { value: res.value, source: res.mirror ? `mirror (${res.mirror})` : `${res.provider}:${name}`, warning: res.warning };
+    }
+    if (res.error) return { error: `provider '${res.provider}' failed: ${res.error}` };
+    if (res.none) return { missing: true, note: res.note };
+
+    // Nothing live, nothing fresh: fall back to the raw mirror entry rather than
+    // reporting a credential we demonstrably still hold.
+    if (!opts.forceProvider) {
+      const mirrored = await daemonCall({ op: "get", name: MIRROR_PREFIX + name }, state.socket);
+      if (mirrored.ok && mirrored.value) return { value: mirrored.value, source: `mirror (unverified)`, stale: true };
+    }
+  }
+  return { missing: true };
+}
+
+/** Resolve several names, first hit wins, one process' worth of work each.
+ *  Returns { value, source, name } | { error } | { locked } | { missing }. */
+export async function lookupFirst(names, opts = {}) {
+  let firstError = null;
+  for (const name of names) {
+    const r = await lookupCred(name, opts);
+    if (r.value != null) return { ...r, name };
+    if (r.locked) return { locked: true };
+    if (r.error && !firstError) firstError = { error: r.error, name };
+  }
+  return firstError ?? { missing: true };
+}
+
 function ensureFDir() {
   fs.mkdirSync(F, { recursive: true });
 }
@@ -286,53 +360,37 @@ async function unlock(passkeyArg, ttl) {
   // exactly like a successful one.
   let daemonErr = "";
   const expiresAt = Date.now() + (ttl ?? DEFAULT_TTL) * 1000;
-  const child = spawn(
-    process.execPath,
-    [
-      DAEMON, "--socket", SOCKET, "--lockfile", LOCKFILE,
-      "--ttl", String(ttl ?? DEFAULT_TTL), "--creds", CREDS,
-      "--expires-at", String(expiresAt),
-    ],
-    { detached: true, stdio: ["pipe", "ignore", "pipe"] }
-  );
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (c) => {
-    if (daemonErr.length < 512) daemonErr += c;
+  const child = spawn(process.execPath, [DAEMON, "--socket", SOCKET, "--lockfile", LOCKFILE, "--ttl", String(ttl ?? DEFAULT_TTL), "--creds", CREDS, "--expires-at", String(expiresAt)], {
+    detached: true,
+    // Daemon stderr was `ignore`d, so the one message that matters — `wrong
+    // passkey` — was thrown away, and the CLI fell through to `unlocked`.
+    stdio: ["pipe", "ignore", "pipe"],
   });
-  child.stdin.on("error", () => {}); // daemon may die before reading (bad passkey)
-  child.on("error", (e) => {
-    daemonErr += `spawn failed: ${e.message}\n`;
-  });
-
-  // Deliver the passkey and make sure it is flushed *before* detaching: with
-  // detached:true, unref-ing first can let this process exit while the secret is
-  // still buffered, and the daemon then starts with an empty passkey.
-  await new Promise((resolve) => {
-    child.stdin.on("close", resolve);
-    child.stdin.on("error", resolve);
-    child.stdin.end(passkey);
-  });
-  // Stop holding this process's event loop open on the detached daemon's streams,
-  // or `f` would never exit. Must come after the passkey is flushed.
+  child.stderr?.on("data", (c) => (daemonErr += c));
+  let daemonCode = null;
+  child.on("exit", (code) => (daemonCode = code));
+  child.stdin.on("error", () => {}); // EPIPE when the daemon exits before reading the passkey
+  child.stdin.write(passkey);
+  child.stdin.end();
   child.unref();
-  child.stderr.on("end", () => {});
+  // Wait briefly for the socket to come up.
+  const up = await waitForSocket(SOCKET, 2000);
+  if (up) return true;
 
-  const up = await waitForSocket(SOCKET, 2000, child);
-  // Socket on disk is necessary, not sufficient: confirm it answers.
-  const ready = up && (await probeSocket(SOCKET));
-  if (!ready) {
-    const detail = daemonErr.trim().split("\n")[0] || "daemon did not start";
-    // Never leave a socket that has no working daemon behind it.
-    if (!pidAlive(readLockfile()?.pid)) {
-      for (const f of [SOCKET, LOCKFILE]) {
-        try {
-          fs.unlinkSync(f);
-        } catch {}
-      }
-    }
-    throw new Error(`unlock failed (${detail})`);
+  // No socket: the daemon refused or died. Say why, in the operator's terms.
+  const why = daemonErr.trim().split("\n")[0] || "daemon did not start";
+  if (/wrong passkey/i.test(daemonErr)) {
+    process.stderr.write(
+      "f: wrong passkey — nothing was unlocked and nothing was written.\n" +
+      "   The store is unchanged. If the passkey is genuinely lost, the entries\n" +
+      "   are unrecoverable; restore a backup with: f creds restore <file>\n"
+    );
+  } else if (daemonCode === 4) {
+    process.stderr.write(`f: ${why}\n`);
+  } else {
+    process.stderr.write(`f: could not unlock: ${why}\n`);
   }
-  return true;
+  return false;
 }
 
 function lock() {
@@ -810,6 +868,10 @@ export function register(ctx) {
       },
       unlock,
       lock,
+      /** Programmatic resolution that includes provider-backed creds. See the
+       *  lookupCred() doc comment for why `f ha`/`f gh` needed this. */
+      lookupCred,
+      lookupFirst,
       /** Resolve a name exactly as `f creds get` does, with provenance.
        *  opts: { localOnly, forceProvider, noCache }. Returns
        *  { value, source, warning? } or throws. Use this from a uck that needs
@@ -866,6 +928,10 @@ export function register(ctx) {
       let localOnly = false;      // --local: never consult providers
       let forceProvider = false;  // --vault: bypass local + mirror, ask providers now
       let showSource = false;     // --source: print provenance alongside the value
+      let lookupRaw = false;      // --raw:   `lookup` prints the bare value
+      let lookupEnv = null;       // --env V: `lookup` prints export V='value'
+      let lookupShow = false;     // --show-value: `lookup` prints name + value
+      let lookupFd = null;        // --fd N[wa]: write the raw value to inherited fd N
       let noCache = false;        // --no-cache: ignore + clear the negative cache
       let showAll = false;        // --all (ls): include provider mirrors
       const a = [...(args._ ?? [])];
@@ -898,6 +964,14 @@ export function register(ctx) {
           showAll = true;
         } else if (a[i] === "--no-cache") {
           noCache = true;
+        } else if (a[i] === "--raw") {
+          lookupRaw = true;
+        } else if (a[i] === "--show-value") {
+          lookupShow = true;
+        } else if (a[i] === "--env") {
+          lookupEnv = a[++i];   // consumed: the VAR name must not reach `pos`
+        } else if (a[i] === "--fd") {
+          lookupFd = a[++i];    // consumed: likewise
         } else if (a[i].startsWith("--")) {
           // Do NOT fall through to pos. Unrecognised `--flags` used to land in
           // `pos`, and `pos[0]` is the command while `pos[1]` is `unlock`'s
@@ -931,9 +1005,10 @@ export function register(ctx) {
             if (rest.length > 1) {
               return usage(`unlock takes at most one passkey argument, got ${rest.length}: ${rest.join(" ")}`);
             }
-            // Throws on failure; f's dispatcher prints `f: <msg>` and exits 1.
-            if (await unlock(rest[0], ttl)) process.stdout.write("f: unlocked\n");
-            break;
+            // Honour the result: unlock() now returns false when the daemon
+            // refused the passkey, and a failed unlock must not exit 0 — a
+            // script that did `f creds unlock && deploy` would otherwise deploy.
+            process.exit((await unlock(rest[0], ttl)) ? 0 : 4);
           case "lock":
             lock();
             break;
@@ -967,6 +1042,7 @@ export function register(ctx) {
             break;
           }
           case "set": {
+            const setState = await requireUnlocked();
             const [name, ...valParts] = rest;
             if (!name) return usage("set needs <name> <value>");
             if (isMirrorKey(name)) return usage(`'${MIRROR_PREFIX}\u2026' is reserved for provider mirrors — drop the prefix`);
@@ -1021,10 +1097,46 @@ export function register(ctx) {
             if (viaArgv) {
               process.stderr.write(`f: note: the value was passed in argv, so any process could read it from \`ps\`; prefer: echo SECRET | f creds set ${name}\n`);
             }
-            // An explicit local value supersedes any mirror of the same name.
-            if (!forceProvider) await dropMirror(MIRROR_PREFIX + name);
+            // Dual-write: if a provider serves this name (it has a mirror or a live
+            // entry), also write it there so the two sources of truth stay in sync.
+            // Before this change a local `set` shadowed the vault, so a provider-backed
+            // cred would silently diverge from its local copy — the exact class of
+            // failure that made `f ha`/`f gh` go blind. The mirror is refreshed from
+            // the new value rather than dropped, so the next read sees the write
+            // without a provider round-trip.
+            let wroteVault = null;
+            if (!forceProvider) {
+              const hadMirror = !!(await rawGet(MIRROR_PREFIX + name, setState));
+              const provs = await listProviders().catch(() => []);
+              const owner = provs.find((p) => p.canWrite === true);
+              if (owner) {
+                try {
+                  if (owner.has && !(await owner.has(name))) {
+                    // not actually backed by the provider — leave the local entry as-is
+                  } else {
+                    await owner.write(name, value);
+                    // Refresh the mirror so it reflects the new value and re-stamps freshness.
+                    const ttlSec = owner.mirrorTtlSec ?? 3600;
+                    await setMirror(MIRROR_PREFIX + name, value, ttlSec * 1000, setState);
+                    wroteVault = owner.name;
+                  }
+                } catch (e) {
+                  process.stderr.write(
+                    `f: wrote locally but the provider '${owner.name}' failed: ${e?.message ?? e}\n` +
+                    `   the vault now holds the OLD value; the local entry is ahead of it.\n`
+                  );
+                }
+              } else if (hadMirror) {
+                // A mirror existed but no provider advertised canWrite: the vault is
+                // configured but not reachable from this process. Drop the stale mirror
+                // so it stops being served as if it were current.
+                await dropMirror(MIRROR_PREFIX + name);
+              }
+            }
             clearMisses(name);
-            process.stdout.write(`set\t${name}${viaArgv ? "" : "\t(stdin)"}\n`);
+            process.stdout.write(
+              `set\t${name}${viaArgv ? "" : "\t(stdin)"}${wroteVault ? `\t+vault:${wroteVault}` : ""}\n`
+            );
             break;
           }
           case "get": {
@@ -1066,6 +1178,82 @@ export function register(ctx) {
 
             if (value != null) process.stdout.write(redact(value) + "\n");
             if (showSource) process.stderr.write(`f: source: ${src}\n`);
+            break;
+          }
+          case "lookup": {
+            // Machine-facing resolution for other ucks, in ONE process: names in
+            // argv order, first hit wins. This exists because a raw socket read
+            // cannot see a provider-backed cred (locally it is only `mirror:<name>`),
+            // and resolving per name in the caller means one nested `f` per name —
+            // which is exactly how `f ha` and `f gh` lost their tokens.
+            //
+            // Output shapes, in order of how much the value is wanted:
+            //   (default)      "<name>\t<source>" — the value is NOT printed
+            //   --raw          the bare value on stdout
+            //   --env VAR      export VAR='<value>'  (single-quote escaped)
+            //   --show-value   "<name>\t<source>\n<value>"
+            // A value never appears on stdout by default: a caller that logs the
+            // resolution must ask for the secret deliberately.
+            const names = rest;
+            if (!names.length) return usage("lookup needs <name>...");
+            const hit = await lookupFirst(names, {
+              localOnly: localOnly,
+              forceProvider: forceProvider,
+            });
+            if (hit.locked) {
+              process.stderr.write("f: creds locked\n");
+              process.exit(3);
+            }
+            if (hit.value == null) {
+              if (hit.error) process.stderr.write(`f: ${hit.error}\n`);
+              else process.stderr.write(`f: no such cred: ${names.join(", ")}\n`);
+              process.exit(1);
+            }
+            if (hit.warning) process.stderr.write(`f: ${hit.warning}\n`);
+            if (lookupRaw) process.stdout.write(hit.value);
+            else if (lookupFd != null) {
+              // Byte-exact delivery on a caller-provided fd, with NOTHING on
+              // stdout. Two reasons this exists instead of --raw:
+              //   * --raw trims a trailing newline, and OpenSSH refuses a PEM
+              //     without one;
+              //   * a caller that pipes stdout can end up with the secret in a
+              //     log, a terminal scrollback, or `$(...)`. Writing to a fd the
+              //     caller opened (a pipe to ssh-add, typically) keeps the value
+              //     off every channel that a human or a shell can capture.
+              // The value's own bytes stay untouched — no newline added, none
+              // removed.
+              // Accept `3`, `3w`, `3a`, and node's pipe form `pipe:3` (the form a
+              // caller uses when it wants the child's write end torn down on
+              // close, which is exactly what keeps a caller from blocking forever
+              // if we exit without writing). Anything else is a typo about to
+              // write a secret somewhere unintended, so it costs one line.
+              const m = /^(?:(\d+)|(pipe:(\d+)))([wa]?)$/.exec(lookupFd);
+              const fd = m ? Number(m[1] ?? m[3]) : NaN;
+              const append = (m?.[4] ?? "") === "a";
+              if (!Number.isInteger(fd) || fd < 3) {
+                process.stderr.write("f: --fd wants an inherited descriptor >= 3 (e.g. 3, 3w, 3a, pipe:3)\n");
+                process.exit(2);
+              }
+              try {
+                const fsMod = await import("node:fs");
+                fsMod.writeFileSync(fd, String(hit.value), append ? { flag: "a" } : { mode: 0o600 });
+                fsMod.writeSync(fd, "\n"); // marker, so the caller can tell 'empty' from 'absent'
+              } catch (e) {
+                process.stderr.write(`f: cannot write to fd ${fd}: ${e?.message ?? e}\n`);
+                process.exit(2);
+              }
+            }
+            else if (lookupEnv) {
+              if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(lookupEnv)) {
+                process.stderr.write(`f: --env needs a shell identifier, got '${lookupEnv}'\n`);
+                process.exit(2);
+              }
+              process.stdout.write(`export ${lookupEnv}='${String(hit.value).replace(/'/g, `'\\''`)}'\n`);
+            } else if (lookupShow) {
+              process.stdout.write(`${hit.name}\t${hit.source}${hit.stale ? " (stale)" : ""}\n${hit.value}\n`);
+            } else {
+              process.stdout.write(`${hit.name}\t${hit.source}${hit.stale ? " (stale)" : ""}\n`);
+            }
             break;
           }
           case "forget": {
@@ -1363,29 +1551,10 @@ export function register(ctx) {
   };
 }
 
-// Ask a socket whether a *working* daemon owns it. Returns the lockfile state
-// only if the daemon answers `ls`; null if absent, unresponsive, or dead. A
-// socket file on disk is not proof: a dead daemon leaves one behind, and a
-// daemon holding a bad key answers `ls` fine yet fails every `get`.
-async function probeSocket(socketPath) {
-  const lf = readLockfile();
-  if (!lf?.pid || !pidAlive(lf.pid)) return null;
-  try {
-    const r = await Promise.race([
-      daemonCall({ op: "ls" }, socketPath),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("timeout")), 1500)
-      ),
-    ]);
-    return r?.ok ? unlockedState() : null;
-  } catch {
-    return null;
-  }
-}
-
-// Resolves true only if the socket appeared, false on daemon death or timeout.
-// (The previous version resolved undefined either way, hiding every failure.)
-function waitForSocket(p, ms, child) {
+/** True when the socket appeared, false on timeout. Callers MUST branch on it:
+ *  a daemon that died on the way up leaves no socket and no error, which is how
+ *  a wrong passkey ended up reported as `unlocked`. */
+function waitForSocket(p, ms) {
   const start = Date.now();
   return new Promise((resolve) => {
     let done = false;
@@ -1395,12 +1564,8 @@ function waitForSocket(p, ms, child) {
       resolve(v);
     };
     const try_ = () => {
-      if (fs.existsSync(p)) {
-        if (child?.exitCode != null) return finish(false); // dead daemon's leftovers
-        return finish(true);
-      }
-      if (child?.exitCode != null) return finish(false);
-      if (Date.now() - start > ms) return finish(false);
+      if (fs.existsSync(p)) return resolve(true);
+      if (Date.now() - start > ms) return resolve(false);
       setTimeout(try_, 50);
     };
     try_();
