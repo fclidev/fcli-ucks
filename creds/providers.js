@@ -161,6 +161,7 @@ function fromChildProcess(stdout) {
     .filter((p) => p && typeof p.name === "string" && p.hasExternalApi !== false)
     .map((p) => ({
       name: p.name,
+      canWrite: p.canWrite === true,   // advertised by the provider; gates `creds set` dual-write
       mirrorTtlSec: typeof p.mirrorTtlSec === "number" ? p.mirrorTtlSec : undefined,
       resolve: (name) => execFileSync(process.execPath, [p.entry, "resolve", String(name)], {
         encoding: "utf8",
@@ -176,6 +177,15 @@ function fromChildProcess(stdout) {
         } catch {
           return false;
         }
+      },
+      // Value on stdin: the same reason `set` refuses argv (any process can read a
+      // secret from `ps` for the command's lifetime). A provider that advertises
+      // canWrite handles `write <name>` on its probe CLI; otherwise this throws.
+      write: (name, value) => {
+        if (p.canWrite !== true) throw new Error(`provider '${p.name}' does not accept writes`);
+        return execFileSync(process.execPath, [p.entry, "write", String(name)], {
+          input: String(value), encoding: "utf8", timeout: 90_000, stdio: ["pipe", "pipe", "pipe"],
+        });
       },
       status: () => {
         try {
