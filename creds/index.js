@@ -1554,6 +1554,28 @@ export function register(ctx) {
 /** True when the socket appeared, false on timeout. Callers MUST branch on it:
  *  a daemon that died on the way up leaves no socket and no error, which is how
  *  a wrong passkey ended up reported as `unlocked`. */
+// True only if a live daemon answers on the socket. The lockfile existing says
+// nothing about the key it holds: a daemon started with a wrong passkey serves
+// `ls` fine and fails later on every `get`, so `unlock` must not treat a stale
+// or wrongly-keyed socket as "already unlocked".
+async function probeSocket(socketPath) {
+  const lf = readLockfile();
+  if (!lf?.pid || !pidAlive(lf.pid)) return null;
+  try {
+    const r = await Promise.race([
+      daemonCall({ op: "ls" }, socketPath),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), 1500)
+      ),
+    ]);
+    return r?.ok ? unlockedState() : null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolves true only if the socket appeared, false on daemon death or timeout.
+// (The previous version resolved undefined either way, hiding every failure.)
 function waitForSocket(p, ms) {
   const start = Date.now();
   return new Promise((resolve) => {

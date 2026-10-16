@@ -529,16 +529,22 @@ await t("an unterminated line at the terminal stores nothing rather than guessin
 });
 
 await t("the prompt goes to stderr, not stdout — a secret never enters captured output", async () => {
-  // The interactive passkey prompt is the same code path. If a refactor wrote
-  // prompts to stdout, `f creds unlock` inside a script would put the passkey in
-  // whatever captured that output.
+  // The interactive passkey prompt is the same raw-mode code path. If a refactor
+  // wrote prompts to stdout, `f creds unlock` inside a script would put the
+  // passkey in whatever captured that output.
   // Unlock takes the passkey from argv when given, so reach the prompt by
   // locking first — and restore the daemon afterwards, since every later test
   // reads through it.
   run(["lock"]);
   const r = runPty(["unlock", "--ttl", "600"], { input: "test-pass" });
   assert.match(r.text, /f: passkey: /, `no passkey prompt: ${JSON.stringify(r.text)}`);
-  assert.match(r.text, /unlocked/, JSON.stringify(r.text));
+  // This version prints nothing on success — `unlock` returns exit 0 silently and
+  // `status` is what reports state. Assert the daemon came up through `status`
+  // rather than matching a word the command never writes.
+  assert.match(run(["status"]).out, /^unlocked/, `daemon not unlocked: ${JSON.stringify(r.text)}`);
+  // In raw mode the child never echoes the passkey, so a second occurrence can
+  // only be the child having printed it back. The tty's own echo before the child
+  // enters raw mode accounts for exactly one.
   const hits = r.text.split("test-pass").length - 1;
   assert.ok(hits <= 1, `passkey echoed by the child (${hits} occurrences): ${JSON.stringify(r.text)}`);
   assert.match(run(["status"]).out, /^unlocked/, "daemon left locked for the rest of the suite");
