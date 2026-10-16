@@ -377,6 +377,27 @@ await t("set still takes a plain argv value when stdin is merely closed", async 
   assert.equal(run(["get", "closed-stdin", "--local", "--secrets"]).out.trim(), "v1");
 });
 
+await t("an unknown --flag is refused, and can never become the passkey", async () => {
+  // `f creds unlock --request X --ttl 1d` looked like success: the parser pushed
+  // unrecognised flags into `pos`, pos[0] was the command and pos[1] was the
+  // passkey, so the store key was derived from the literal string `--request`
+  // while `status` cheerfully reported `unlocked (1439m left)`. Every value then
+  // failed to decrypt. A typo'd flag must cost one line, not the store.
+  const r = run(["unlock", "--request", "some-cred", "--ttl", "600"], { allowFail: true });
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /unknown flag\(s\): --request/);
+  assert.ok(!/^unlocked/m.test(r.out), "must not report success");
+  // the running daemon must still be the suite's, keyed by the real passkey
+  run(["set", "daemon-still-works", "v"]);
+  assert.equal(run(["get", "daemon-still-works", "--local", "--secrets"]).out.trim(), "v");
+});
+
+await t("unlock refuses more than one positional argument", async () => {
+  const r = run(["unlock", "one", "two"], { allowFail: true });
+  assert.notEqual(r.code, 0);
+  assert.match(r.err + r.out, /at most one passkey/);
+});
+
 // Teardown and report come LAST. They used to sit here in the middle, so every
 // test appended below the report line was never executed and the suite still
 // printed "17 passed, 0 failed" — a green run that silently tested less than it

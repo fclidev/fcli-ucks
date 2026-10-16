@@ -764,6 +764,7 @@ export function register(ctx) {
       let ttl = DEFAULT_TTL;
       let timeoutSec = 300; // default wait window for `request`
       let showSecrets = false;
+      const unknownFlags = [];
       let force = false;
       let dryRun = false;
       let outDir = null;
@@ -804,11 +805,24 @@ export function register(ctx) {
           showAll = true;
         } else if (a[i] === "--no-cache") {
           noCache = true;
+        } else if (a[i].startsWith("--")) {
+          // Do NOT fall through to pos. Unrecognised `--flags` used to land in
+          // `pos`, and `pos[0]` is the command while `pos[1]` is `unlock`'s
+          // passkey — so `f creds unlock --request foo` "succeeded" by deriving
+          // the store key from the literal string `--request`, leaving a daemon
+          // that reported `unlocked` while every decrypt failed. A typo'd flag
+          // must cost one line, not the store.
+          unknownFlags.push(a[i]);
         } else pos.push(a[i]);
       }
       const redact = (value) =>
         showSecrets ? String(value) : `[redacted — pass --secrets to reveal]`;
       const [cmd, ...rest] = pos;
+      if (unknownFlags.length) {
+        // usage() ends in process.exit(1), so anything after it is unreachable —
+        // pass the reason IN rather than writing it and expecting to set 2.
+        return usage(`unknown flag(s): ${unknownFlags.join(", ")}`);
+      }
 
       // Returned, not fired-and-forgotten. An unawaited floating IIFE means the
       // caller cannot know when a command finished (a test driver had to poll for
@@ -818,6 +832,12 @@ export function register(ctx) {
       return (async () => {
         switch (cmd) {
           case "unlock":
+            // A passkey that begins with '-' would be indistinguishable from a
+            // flag; refuse rather than derive a key from something the operator
+            // believes was parsed as an option.
+            if (rest.length > 1) {
+              return usage(`unlock takes at most one passkey argument, got ${rest.length}: ${rest.join(" ")}`);
+            }
             await unlock(rest[0], ttl);
             break;
           case "lock":
