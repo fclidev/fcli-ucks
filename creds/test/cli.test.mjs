@@ -39,12 +39,17 @@ fs.mkdirSync(path.join(TMP, ".f"), { recursive: true });
 
 const ENV = { ...process.env, HOME: TMP };
 
-const run = (args, { allowFail = false, input = "" } = {}) => {
+const run = (args, { allowFail = false, input = "", stdinMode = "pipe" } = {}) => {
   try {
     // execFileSync exposes stderr on failure only, so the success path reads it
     // off a pipe manually — `has`/`meta` put their explanatory hints there.
+    // stdin "pipe" (default) always creates a pipe, so an empty input is
+    // indistinguishable from a closed one; "ignore" gives the child /dev/null
+    // like a plain shell invocation. Without this, a mutant that treats a closed
+    // pipe as "a secret was piped" passes every test.
     const r = spawnSync(process.execPath, [path.join(here, "run-command.mjs"), ...args], {
       encoding: "utf8", env: ENV, cwd: SAFE_CWD, timeout: 30000, input,
+      stdio: stdinMode === "ignore" ? ["ignore", "pipe", "pipe"] : undefined,
     });
     const code = r.status ?? 1;
     // spawnSync reports non-zero without throwing, so the old "did it fail?"
@@ -67,6 +72,16 @@ const sockPath = () => JSON.parse(fs.readFileSync(DAEMON_FILE, "utf8")).socket;
 
 // index.js does not export its socket helper, so speak the same bytes directly.
 const net = await import("node:net");
+// Provenance lives in the PLAINTEXT cache file, not the encrypted box, keyed
+// `src:<mirrorKey>`. Tests write it directly to set up the state the bug needs.
+const CACHE = path.join(TMP, ".f", ".creds-cache.json");
+const readCacheFile = () => { try { return JSON.parse(fs.readFileSync(CACHE, "utf8")); } catch { return {}; } };
+const setMirrorSourceForTest = (k, provider) => {
+  const c = readCacheFile(); c["src:" + k] = { provider, expiresAt: Date.now() + 600_000 };
+  fs.writeFileSync(CACHE, JSON.stringify(c));
+};
+const mirrorSourceForTest = (k) => readCacheFile()["src:" + k]?.provider ?? null;
+
 const call = (o) => new Promise((resolve, reject) => {
   const c = net.default.connect(sockPath(), () => c.write(JSON.stringify(o)));
   let buf = "";
@@ -278,6 +293,94 @@ await t("a name cannot be a local cred AND a mirror at once via the CLI", async 
 
 /* ----------------------------------------------------------- cleanup ----- */
 
+/* teardown + report moved to the end of the file */
+
+await t("set reads the value from stdin so it never enters argv", async () => {
+  run(["set", "via-stdin"], { input: "s3cr3t-from-stdin\n" });
+  assert.equal(run(["get", "via-stdin", "--local", "--secrets"]).out.trim(), "s3cr3t-from-stdin");
+  // `-` means stdin explicitly, even with a value-looking token after it
+  run(["set", "via-dash", "-"], { input: "dash-value\n" });
+  assert.equal(run(["get", "via-dash", "--local", "--secrets"]).out.trim(), "dash-value");
+  // the name is echoed so a pipe knows what landed
+  assert.match(run(["set", "echo-check"], { input: "v\n" }).out, /echo-check\t\(stdin\)/);
+});
+
+await t("set warns when the value IS in argv — the exposure is real", async () => {
+  const r = run(["set", "argv-thing", "value-in-ps"]);
+  assert.equal(r.code, 0, "`set <name> <value>` must keep working (compat)");
+  assert.match(r.err, /argv.*`ps`|`ps`/s);
+  assert.match(r.err, /echo SECRET \| f creds set argv-thing/);
+});
+
+await t("set with no value and no pipe refuses rather than storing nothing", async () => {
+  // A TTY stdin means nobody meant to pipe; hanging on an invisible prompt would
+  // be worse than refusing. isTTY is forced via a pty-less `-e` probe elsewhere,
+  // so here we assert the piped-but-empty case, which is the one a script hits.
+  const r = run(["set", "empty-thing"], { allowFail: true, input: "" });
+  assert.notEqual(r.code, 0);
+  assert.match(r.err + r.out, /empty value/);
+  assert.equal(run(["has", "empty-thing"], { allowFail: true }).code, 1, "nothing was stored");
+});
+
+await t("deleting a mirror deletes its provenance record too", async () => {
+  // The value lives in the encrypted box; provenance lives in the plaintext
+  // cache file. rm that only touches the first leaves a record naming a
+  // provider for a mirror that no longer exists — clearMirrorSource existed for
+  // this and was never called.
+  await putMirror("prov-a", "v");
+  setMirrorSourceForTest("mirror:prov-a", "dummyprov");
+  assert.equal(mirrorSourceForTest("mirror:prov-a"), "dummyprov");
+  run(["rm", "prov-a"]);
+  assert.equal(mirrorSourceForTest("mirror:prov-a"), null,
+    "provenance outlived the mirror");
+});
+
+await t("`set` over a mirror clears that mirror's provenance record", async () => {
+  await putMirror("prov-b", "v");
+  setMirrorSourceForTest("mirror:prov-b", "dummyprov");
+  run(["set", "prov-b", "local-now"]);
+  assert.equal(mirrorSourceForTest("mirror:prov-b"), null);
+  // and the provider must not be resurrected into `has` output
+  const r = run(["has", "prov-b"]);
+  assert.ok(!/dummyprov/.test(r.err), `stale provider leaked into hint: ${r.err}`);
+});
+
+await t("forget cleans provenance for a name with NO entry at all", async () => {
+  // Expiry is a freshness policy enforced in the CLI, not a deletion: the daemon
+  // keeps expired entries (see daemon.js `set`, which only stamps expiresAt).
+  // So a genuinely-absent entry is the case that used to strand the record.
+  setMirrorSourceForTest("mirror:prov-c", "dummyprov");
+  assert.equal((await call({ op: "has", name: "mirror:prov-c" })).exists, false);
+  const r = run(["forget", "prov-c"]);
+  assert.match(r.out, /no mirror\tprov-c/);
+  assert.equal(mirrorSourceForTest("mirror:prov-c"), null,
+    "must clean provenance even when there is no value to delete");
+});
+
+await t("set refuses to guess when a value is BOTH an argument and on stdin", async () => {
+  // Silently preferring argv here stored the wrong secret in testing: a script
+  // that piped a rotated token and also had a stale value argument got the stale
+  // one, with exit 0. Ambiguity about which credential to store must be an error.
+  const r = run(["set", "ambig", "argv-value"], { allowFail: true, input: "piped-value\n" });
+  assert.notEqual(r.code, 0);
+  assert.match(r.err + r.out, /refusing to choose/);
+  assert.equal(run(["has", "ambig"], { allowFail: true }).code, 1, "nothing stored");
+});
+
+await t("set still takes a plain argv value when stdin is merely closed", async () => {
+  // The common `f creds set x y` case: stdin is not a terminal but carries
+  // nothing. Treating a closed pipe as "a secret was piped" would break every
+  // existing invocation.
+  // /dev/null stdin, exactly what `f creds set x y` sees from a shell.
+  const r = run(["set", "closed-stdin", "v1"], { stdinMode: "ignore" });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(run(["get", "closed-stdin", "--local", "--secrets"]).out.trim(), "v1");
+});
+
+// Teardown and report come LAST. They used to sit here in the middle, so every
+// test appended below the report line was never executed and the suite still
+// printed "17 passed, 0 failed" — a green run that silently tested less than it
+// claimed.
 try { run(["lock"]); } catch { /* best effort */ }
 fs.rmSync(TMP, { recursive: true, force: true });
 fs.rmSync(SAFE_CWD, { recursive: true, force: true });
