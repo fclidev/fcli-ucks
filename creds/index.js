@@ -5,7 +5,7 @@
 // Provider table (see ./providers.js): every uck that exports a
 // `credentialProvider` is consulted when a name is missing from the box, and the
 // answer is mirrored back in as `mirror:<name>` with a ttl. Local always wins.
-import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryError, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource } from "./providers.js";
+import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryError, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource, clearMirrorSource } from "./providers.js";
 
 import net from "node:net";
 import fs from "node:fs";
@@ -31,6 +31,38 @@ async function setMirror(name, value, ttlMs, state) {
     st.socket,
   );
   if (!r.ok) throw new Error(r.error);
+}
+
+/** Read all of piped stdin. Used by `set` so a secret need not sit in argv. */
+function readAllStdin() {
+  return new Promise((resolve, reject) => {
+    let buf = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (c) => (buf += c));
+    process.stdin.on("end", () => resolve(buf));
+    process.stdin.on("error", reject);
+  });
+}
+
+/**
+ * Delete a mirror entry AND the provenance record describing it.
+ *
+ * The two live in different places — the value in the encrypted box, the
+ * `src:<key>` provenance in the plaintext cache file — so a deletion that skips
+ * the second leaves a record naming a provider for a mirror that no longer
+ * exists. `clearMirrorSource` was exported for exactly this and never called.
+ * One helper so the pair cannot drift apart at a future call site.
+ *
+ * Uses daemonCall, not op(): op() process.exit(1)s on a missing entry and that
+ * is uncatchable, so a mirror expiring mid-sweep would abort the whole sweep.
+ */
+async function dropMirror(key, state) {
+  const st = state ?? (await requireUnlocked());
+  const r = await daemonCall({ op: "rm", name: key }, st.socket).catch(() => ({ ok: false }));
+  // Clear provenance even when the entry was already gone: an expired mirror
+  // leaving its record behind is precisely the leak being fixed.
+  clearMirrorSource(key);
+  return !!r?.ok;
 }
 
 /**
@@ -822,21 +854,50 @@ export function register(ctx) {
           }
           case "set": {
             const [name, ...valParts] = rest;
-            if (!name || valParts.length === 0) return usage("set requires <name> <value>");
+            if (!name) return usage("set needs <name> <value>");
             if (isMirrorKey(name)) return usage(`'${MIRROR_PREFIX}\u2026' is reserved for provider mirrors — drop the prefix`);
-            await op("set", { name, value: valParts.join(" ") });
-            // An explicit local value supersedes any mirror of the same name.
-            // NOT via op(): op() calls process.exit(1) on a missing entry, and a
-            // process.exit inside `try { await op(...) } catch {}` is uncatchable
-            // — the command died with `no such cred: mirror:<name>` AFTER the set
-            // had already succeeded, so every plain `f creds set <name>` of a name
-            // with no mirror exited 1 while doing exactly what was asked. Ask the
-            // daemon directly and treat "no mirror" as the normal case.
-            if (!forceProvider) {
-              const st = await requireUnlocked();
-              await daemonCall({ op: "rm", name: MIRROR_PREFIX + name }, st.socket).catch(() => {});
+            // The value must not require argv: anything on the machine can read it
+            // from `ps` for the command's lifetime. This uck's own provider helper
+            // (credsSet in the vaultwarden uck) already refuses argv for exactly
+            // that reason; the CLI was contradicting the library beside it.
+            //   echo SECRET | f creds set <name>          (piped, no value arg)
+            //   f creds set <name> -                      (explicit stdin)
+            //   f creds set <name> <value>                (still works; see warning)
+            // Stdin is read only when no value argument was given. Passing BOTH a
+            // value argument and a pipe is rejected rather than resolved: picking
+            // either side would silently discard a secret the caller supplied, and
+            // in a script that is how the wrong credential gets stored.
+            const hasValueArg = valParts.length > 0 && !(valParts.length === 1 && valParts[0] === "-");
+            const explicitStdin = valParts.length === 1 && valParts[0] === "-";
+            let value, viaArgv = false;
+            if (hasValueArg && !process.stdin.isTTY) {
+              // Only complain if there is actually something in the pipe; a plain
+              // `f creds set x y` in a shell usually has /dev/null or a terminal on
+              // stdin, and a closed pipe is not an attempt to pipe a secret.
+              const piped = await readAllStdin();
+              if (piped.trim() !== "") {
+                return usage(`refusing to choose: a value was given as an argument AND on stdin — drop one (piped value wins if you use '${name} -')`);
+              }
+              value = valParts.join(" ");
+              viaArgv = true;
+            } else if (hasValueArg) {
+              value = valParts.join(" ");
+              viaArgv = true;
+            } else {
+              if (process.stdin.isTTY) {
+                return usage(`set needs a value${explicitStdin ? " (stdin was empty)" : " — pipe it (echo SECRET | f creds set " + name + ") or pass it as an argument"}`);
+              }
+              value = (await readAllStdin()).replace(/\n$/, "");
             }
+            if (value === "") return usage("empty value — nothing stored (a secret of zero length is usually a mistake)");
+            await op("set", { name, value });
+            if (viaArgv) {
+              process.stderr.write(`f: note: the value was passed in argv, so any process could read it from \`ps\`; prefer: echo SECRET | f creds set ${name}\n`);
+            }
+            // An explicit local value supersedes any mirror of the same name.
+            if (!forceProvider) await dropMirror(MIRROR_PREFIX + name);
             clearMisses(name);
+            process.stdout.write(`set\t${name}${viaArgv ? "" : "\t(stdin)"}\n`);
             break;
           }
           case "get": {
@@ -888,12 +949,9 @@ export function register(ctx) {
             const state = await requireUnlocked();
             if (!names) {
               const r = await daemonCall({ op: "ls" }, state.socket);
-              // daemonCall, not op(): op() process.exit(1)s on a missing entry and
-              // that is uncatchable, so a mirror deleted underneath us by expiry
-              // would abort the whole sweep.
-              for (const n of (r.names ?? []).filter(isMirrorKey)) {
-                await daemonCall({ op: "rm", name: n }, state.socket).catch(() => {});
-              }
+              // dropMirror also clears the provenance record; op() would exit(1)
+              // on an entry that expired mid-sweep.
+              for (const n of (r.names ?? []).filter(isMirrorKey)) await dropMirror(n, state);
               break;
             }
             for (const n of names) {
@@ -904,9 +962,11 @@ export function register(ctx) {
               // `mirror:<name>` key, which is not a name anyone typed.
               const exists = (await daemonCall({ op: "has", name: key }, state.socket).catch(() => ({ exists: false })))?.exists;
               if (exists) {
-                await daemonCall({ op: "rm", name: key }, state.socket).catch(() => {});
+                await dropMirror(key, state);
                 process.stdout.write(`forgot\t${n}\n`);
               } else {
+                // Still clear provenance: a mirror that expired left its record.
+                clearMirrorSource(key);
                 process.stdout.write(`no mirror\t${n}\n`);
               }
               clearMisses(n);
@@ -1094,11 +1154,11 @@ export function register(ctx) {
               }
               let removedLocal = false, removedMirror = false;
               if (localR?.exists) { await op("rm", { name: localKey }); removedLocal = true; }
-              // daemonCall, not op(): op() process.exit(1)s internally, which no
-              // .catch() can intercept, so the follow-up notes below would never
-              // print and the command would look like a failed delete.
+              // daemonCall via dropMirror, not op(): op() process.exit(1)s internally,
+              // which no .catch() can intercept, so the honest notes below would
+              // never print and the command would look like a failed delete.
               if (mirrorR?.exists) {
-                await daemonCall({ op: "rm", name: mirrorKey }, st.socket).catch(() => {});
+                await dropMirror(mirrorKey, st);
                 removedMirror = true;
               }
               if (removedLocal) process.stdout.write(`removed\t${nm}\n`);
@@ -1197,7 +1257,9 @@ function usage(msg) {
       "                                    (e.g. 900, 45m, 2h, 1d, 1d6h30m; default 10m)\n" +
       "  lock                            stop daemon, zeroize key\n" +
       "  status                          locked / unlocked + time left, + provider readiness\n" +
-      "  set <name> <value>              store a cred (also clears that name's mirror)\n" +
+      "  set <name> [value|-]           store a cred (also clears that name's mirror);\n" +
+      "                                    no value (or `-`) reads stdin, so the\n" +
+      "                                    secret never appears in `ps`\n" +
       "  get <name> [--secrets]          print a cred (redacted without --secrets);\n" +
       "                                    on a local miss, consult credential\n" +
       "                                    providers and mirror the hit\n" +
