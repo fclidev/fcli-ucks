@@ -17,7 +17,8 @@ f creds unlock [passkey] [--ttl d]      start daemon; --ttl accepts s/m/h/d/w
                                         (900, 45m, 2h, 1d, 1d6h30m; default 10m)
 f creds lock                            stop daemon, zeroize key
 f creds status                          locked / unlocked + time left
-f creds set <name> <value>              store a cred
+f creds set <name> [<value>|-]          store a cred; no value reads stdin
+                                        (pipe it, or type it at a TTY — no echo)
 f creds get <name> [--secrets]          print a cred (redacted without --secrets)
 f creds request <name> [--timeout sec]  block until the cred is set elsewhere
 f creds waiters                         list open waiting requests (other terminals)

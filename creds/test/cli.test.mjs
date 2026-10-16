@@ -23,8 +23,14 @@ const here = path.dirname(path.resolve(import.meta.filename));
 const CREDS = path.dirname(here);
 const REAL_HOME = os.homedir();
 
-let pass = 0, fail = 0;
-const t = async (label, fn) => {
+let pass = 0, fail = 0, skipped = 0;
+const t = async (label, opts, fn) => {
+  if (typeof opts === "function") { fn = opts; opts = {}; }
+  if (opts.skip) {
+    skipped++;
+    console.log(`skip ${label}`);
+    return;
+  }
   try { await fn(); pass++; console.log(`ok   ${label}`); }
   catch (e) { fail++; console.log(`FAIL ${label}\n     ${String(e?.message ?? e).split("\n").join("\n     ")}`); }
 };
@@ -313,13 +319,24 @@ await t("set warns when the value IS in argv — the exposure is real", async ()
 });
 
 await t("set with no value and no pipe refuses rather than storing nothing", async () => {
-  // A TTY stdin means nobody meant to pipe; hanging on an invisible prompt would
-  // be worse than refusing. isTTY is forced via a pty-less `-e` probe elsewhere,
-  // so here we assert the piped-but-empty case, which is the one a script hits.
+  // A TTY stdin no longer refuses — it prompts (see the pty probe at the end of
+  // this file). The script-visible case is a pipe carrying nothing.
   const r = run(["set", "empty-thing"], { allowFail: true, input: "" });
   assert.notEqual(r.code, 0);
   assert.match(r.err + r.out, /empty value/);
   assert.equal(run(["has", "empty-thing"], { allowFail: true }).code, 1, "nothing was stored");
+});
+
+/* ------------------------------------------------- the dash-means-pipe rule -- */
+
+await t("`set <name> -` refuses when the pipe is empty instead of prompting", async () => {
+  // `-` is an explicit statement that a pipe carries the value. If the pipe is
+  // empty, prompting for a secret would be the worst outcome: the caller is a
+  // script with nobody at the keyboard, so it hangs until a timeout.
+  const r = run(["set", "dash-empty", "-"], { allowFail: true, input: "" });
+  assert.notEqual(r.code, 0);
+  assert.match(r.err + r.out, /empty value/);
+  assert.equal(run(["has", "dash-empty"], { allowFail: true }).code, 1, "nothing stored");
 });
 
 await t("deleting a mirror deletes its provenance record too", async () => {
@@ -398,12 +415,137 @@ await t("unlock refuses more than one positional argument", async () => {
   assert.match(r.err + r.out, /at most one passkey/);
 });
 
+/* ------------------------------------------- set at a real terminal ------ */
+
+// The pipe path was tested for a long time and the TTY path was not, which is
+// exactly how `f creds set gh-token` at a keyboard — the most common way a human
+// stores a rotated credential — ended up refusing with "set needs a value" while
+// every green test described a piped invocation. A pipe cannot prove the prompt
+// branch exists: isTTY is false there no matter what is written into the pipe.
+// So drive the real CLI through a pty.
+const PTY_DRIVER = path.join(here, "pty-drive.py");
+// Running it with no arguments exits 2 with a usage line: that proves python3 is
+// present, the stdlib pty import works, and the file parses. Anything else means
+// the driver is broken, which is a different message than "not applicable".
+const PTY_PROBE = spawnSync("python3", [PTY_DRIVER], { encoding: "utf8" });
+const HAS_PTY = PTY_PROBE.status === 2;
+
+// A terminal-driven check that silently skips is how the refusal survived: every
+// pipe test passed and nobody typed the command. So a missing driver is fatal,
+// not a skip — a green run must not be possible with the TTY path unexercised.
+if (!HAS_PTY) {
+  console.error("f creds tests require python3 with the stdlib pty module (see test/pty-drive.py).\n" +
+    `Probe exited ${PTY_PROBE.status}: ${(PTY_PROBE.stderr ?? "").trim()}\n` +
+    "Without it the interactive `set` prompt is untested, which is exactly the blind spot\n" +
+    "that let `f creds set <name>` at a keyboard refuse with 'set needs a value'.");
+  process.exit(2);
+}
+
+// The driver is a child of the HOME-isolated suite: it must see the throwaway
+// HOME (so it touches the suite's daemon, not the real store) and run in the
+// scratch cwd. It is NOT torn down with TMP — it lives beside the driver file.
+// (driver is a checked-in file; no temp dir needed)
+
+const runPty = (args, { input = "", noeol = false } = {}) => {
+  // `input` is a stand-in for a real secret, so it travels to the driver over a
+  // pipe — never argv, never the environment. Both are readable via
+  // /proc/<pid>/cmdline and /proc/<pid>/environ, which would make the harness
+  // leak in exactly the way `f creds set <name> <value>` does.
+  const r = spawnSync("python3", [PTY_DRIVER, SAFE_CWD, "--", process.execPath, path.join(here, "run-command.mjs"), ...args], {
+    encoding: "utf8", cwd: SAFE_CWD, timeout: 60000,
+    env: { ...ENV, ...(noeol ? { PTY_NOEOL: "1" } : {}) },
+    input: input + "\n",
+  });
+  const verdict = (r.stdout ?? "").trim().split("\n").filter(Boolean).pop();
+  try {
+    return JSON.parse(verdict);
+  } catch (e) {
+    // The driver prints one JSON line; anything else means it died. Surface its
+    // stderr — a Python SyntaxError used to look like a failing assertion.
+    throw new Error(`pty driver produced no verdict (${e.message})\n${(r.stderr ?? "").trim()}`);
+  }
+};
+
+await t("set at a terminal prompts for the value instead of refusing", async () => {
+  // The regression: `f creds set gh-token` at a keyboard — the normal way an
+  // operator stores a rotated credential — answered "set needs a value" and
+  // dumped usage, while every piped test stayed green because a pipe can never
+  // reach this branch.
+  const r = runPty(["set", "tty-cred"], { input: "typed-at-tty" });
+  assert.match(r.text, /f: tty-cred/, `no prompt shown: ${JSON.stringify(r.text)}`);
+  assert.match(r.text, /set\ttty-cred/, `did not store: ${JSON.stringify(r.text)}`);
+  assert.equal(run(["get", "tty-cred", "--local", "--secrets"]).out.trim(), "typed-at-tty");
+  // The pty echoes the driver's keystroke until the child enters raw mode, so
+  // "the secret appears nowhere" is unfalsifiable. What matters and is
+  // falsifiable: the child does not print the value back after reading it. Raw
+  // mode is on, so a second occurrence means the child echoed it.
+  const hits = r.text.split("typed-at-tty").length - 1;
+  assert.ok(hits <= 1, `child echoed the secret (${hits} occurrences): ${JSON.stringify(r.text)}`);
+});
+
+await t("an empty line at the terminal prompt stores nothing", async () => {
+  const r = runPty(["set", "tty-empty"], { input: "" });
+  assert.match(r.text, /empty value/, JSON.stringify(r.text));
+  assert.equal(run(["has", "tty-empty"], { allowFail: true }).code, 1, "nothing stored");
+});
+
+await t("`set <name> -` at a terminal refuses rather than prompting", async () => {
+  // `-` says the value comes from a pipe. Prompting anyway would store whatever
+  // a human happened to type in place of the piped value the script expected.
+  const r = runPty(["set", "tty-dash", "-"], { input: "should-not-be-stored" });
+  assert.match(r.text, /stdin was empty/, JSON.stringify(r.text));
+  assert.ok(!/set\ttty-dash/.test(r.text), "stored despite an explicit `-`");
+  assert.equal(run(["has", "tty-dash"], { allowFail: true }).code, 1, "nothing stored");
+});
+
+await t("a value argument at a terminal does not hang waiting on a prompt", async () => {
+  // isTTY is true and stdin is the keyboard: the argv branch must not read
+  // stdin, or every interactive `f creds set x y` blocks for a keypress.
+  const r = runPty(["set", "tty-argv", "argv-value"], { input: "" });
+  assert.match(r.text, /set\ttty-argv/, JSON.stringify(r.text));
+  assert.equal(run(["get", "tty-argv", "--local", "--secrets"]).out.trim(), "argv-value");
+});
+
+await t("the terminal prompt does not swallow the value into stdout", async () => {
+  // A secret must never reach stdout: callers capture stdout, and `f creds set`
+  // inside a script would otherwise land it in a log or a shell history file.
+  // The prompt belongs on stderr, and the transcript proves where it was
+  // written only because the driver separates the two — assert the protocol
+  // instead: `set` prints exactly one stdout line, the confirmation.
+  const r = run(["set", "stdout-check"], { input: "piped-value\n" });
+  assert.equal(r.out, "set\tstdout-check\t(stdin)\n", `stdout carried more than the confirmation: ${JSON.stringify(r.out)}`);
+  assert.ok(!r.out.includes("piped-value"), "value leaked to stdout");
+});
+
+await t("an unterminated line at the terminal stores nothing rather than guessing", async () => {
+  // Raw mode turns the tty line discipline off, so the reader gets exactly the
+  // bytes the terminal sends and must wait for the Enter keystroke. Auto-storing
+  // a token that was never submitted would persist a truncated secret, which is
+  // worse than waiting: a wrong credential is used silently, a missing one is
+  // asked for. No terminator in, nothing stored.
+  const r = runPty(["set", "tty-noeol"], { input: "half-typed", noeol: true });
+  assert.ok(!/set\ttty-noeol/.test(r.text), "stored a line the operator never submitted");
+  assert.equal(run(["has", "tty-noeol"], { allowFail: true }).code, 1, "nothing stored");
+});
+
+await t("the prompt goes to stderr, not stdout — a secret never enters captured output", async () => {
+  // The interactive passkey prompt is the same code path. If a refactor wrote
+  // prompts to stdout, `f creds unlock` inside a script would put the passkey in
+  // whatever captured that output.
+  // Unlock takes the passkey from argv when given, so reach the prompt by
+  // locking first — and restore the daemon afterwards, since every later test
+  // reads through it.
+  run(["lock"]);
+  const r = runPty(["unlock", "--ttl", "600"], { input: "test-pass" });
+  assert.match(r.text, /f: passkey: /, `no passkey prompt: ${JSON.stringify(r.text)}`);
+  assert.match(r.text, /unlocked/, JSON.stringify(r.text));
+  const hits = r.text.split("test-pass").length - 1;
+  assert.ok(hits <= 1, `passkey echoed by the child (${hits} occurrences): ${JSON.stringify(r.text)}`);
+  assert.match(run(["status"]).out, /^unlocked/, "daemon left locked for the rest of the suite");
+});
+
 // Teardown and report come LAST. They used to sit here in the middle, so every
-// test appended below the report line was never executed and the suite still
-// printed "17 passed, 0 failed" — a green run that silently tested less than it
-// claimed.
-try { run(["lock"]); } catch { /* best effort */ }
 fs.rmSync(TMP, { recursive: true, force: true });
 fs.rmSync(SAFE_CWD, { recursive: true, force: true });
-console.log(`\n${pass} passed, ${fail} failed`);
+console.log(`\n${pass} passed, ${fail} failed${skipped ? `, ${skipped} skipped` : ""}`);
 process.exit(fail ? 1 : 0);

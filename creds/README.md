@@ -22,7 +22,7 @@ services, no external binaries.
 
 | command | what it does |
 |---|---|
-| `set <name> <value>` | store a cred (also clears that name's mirror) |
+| `set <name> [<value>\|-]` | store a cred (also clears that name's mirror). No value: reads a pipe, or prompts without echo on a terminal — the secret never lands in `ps` |
 | `get <name> [--secrets]` | print a cred — **redacted without `--secrets`** |
 | `ls` / `has <name>` / `rm <name>` | list / test existence / delete |
 | `meta <name>` | existence + size + bytes without decrypting the value |

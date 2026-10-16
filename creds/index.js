@@ -976,6 +976,7 @@ export function register(ctx) {
             // that reason; the CLI was contradicting the library beside it.
             //   echo SECRET | f creds set <name>          (piped, no value arg)
             //   f creds set <name> -                      (explicit stdin)
+            //   f creds set <name>                        (interactive prompt, no echo)
             //   f creds set <name> <value>                (still works; see warning)
             // Stdin is read only when no value argument was given. Passing BOTH a
             // value argument and a pipe is rejected rather than resolved: picking
@@ -999,9 +1000,21 @@ export function register(ctx) {
               viaArgv = true;
             } else {
               if (process.stdin.isTTY) {
-                return usage(`set needs a value${explicitStdin ? " (stdin was empty)" : " — pipe it (echo SECRET | f creds set " + name + ") or pass it as an argument"}`);
+                // A terminal is not "no input", it is input. Refusing here made
+                // `f creds set <name>` unusable interactively — the most common
+                // way a human stores a rotated credential — and pushed the
+                // operator toward argv, where `ps` reads the secret. `unlock`
+                // already prompts on a TTY; `set` does the same. With `-` the
+                // caller said the value comes from a pipe, so if nothing came we
+                // refuse rather than prompt: the caller may be a script with
+                // nobody at the keyboard, and a prompt there is a hang. The
+                // prompt goes to stderr, where the secret cannot land.
+                if (explicitStdin) return usage("set needs a value (stdin was empty)");
+                process.stderr.write(`f: ${name} (input is a terminal; an empty line aborts): `);
+                value = (await promptVisible("")) ?? "";
+              } else {
+                value = (await readAllStdin()).replace(/\n$/, "");
               }
-              value = (await readAllStdin()).replace(/\n$/, "");
             }
             if (value === "") return usage("empty value — nothing stored (a secret of zero length is usually a mistake)");
             await op("set", { name, value });
@@ -1404,8 +1417,9 @@ function usage(msg) {
       "  lock                            stop daemon, zeroize key\n" +
       "  status                          locked / unlocked + time left, + provider readiness\n" +
       "  set <name> [value|-]           store a cred (also clears that name's mirror);\n" +
-      "                                    no value (or `-`) reads stdin, so the\n" +
-      "                                    secret never appears in `ps`\n" +
+      "                                    no value (or `-`) reads stdin, and a TTY\n" +
+      "                                    prompts without echo, so the secret\n" +
+      "                                    never appears in `ps`\n" +
       "  get <name> [--secrets]          print a cred (redacted without --secrets);\n" +
       "                                    on a local miss, consult credential\n" +
       "                                    providers and mirror the hit\n" +
