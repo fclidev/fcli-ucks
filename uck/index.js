@@ -258,6 +258,7 @@ function usage(msg) {
   process.stderr.write(
     line +
       "usage: f uck <cmd>\n" +
+      "  new <name> [--bucket <b>] [--desc <d>]   scaffold a new uck dir\n" +
       "  repo add <name> <url> [--ref <ref>]   register a push target\n" +
       "  repo ls                               list push targets\n" +
       "  repo rm <name>                        unregister a target\n" +
@@ -265,6 +266,55 @@ function usage(msg) {
       "      [--no-rebase]                       FF-only push (default: rebase)\n"
   );
   process.exit(1);
+}
+
+/**
+ * `f uck new <name>` — scaffold a contract-compliant uck in the store.
+ * Contract (CONTRACT.md §1): one dir per uck, index.js + package.json
+ * ({"name": "<bucket>-<name>", "type": "module"}), side-effect-free module
+ * scope, register(ctx) returning { name, desc, run }.
+ */
+function cmdNew(rest) {
+  const name = rest[0];
+  if (!name || !/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+    return usage("new needs a name (lowercase alnum + dashes)");
+  }
+  let bucket = null;
+  let desc = "";
+  for (let i = 1; i < rest.length; i++) {
+    if (rest[i] === "--bucket") bucket = rest[++i];
+    else if (rest[i] === "--desc") desc = rest[++i];
+  }
+  if (!bucket) {
+    // default to the first bucket that is a git clone (a real repo to commit to)
+    for (const b of loadTargets().map((t) => t.name)) {
+      if (fs.existsSync(path.join(F, "ucks", b, ".git"))) { bucket = b; break; }
+    }
+  }
+  if (!bucket) return usage("no bucket — pass --bucket <name> (a store dir under ~/.f/ucks)");
+  const dir = path.join(F, "ucks", bucket, name);
+  if (fs.existsSync(dir)) {
+    process.stderr.write(`f uck: ${dir} already exists\n`);
+    process.exit(1);
+  }
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: `${bucket}-${name}`, type: "module" }, null, 2) + "\n");
+  fs.writeFileSync(
+    path.join(dir, "index.js"),
+    `export function register(ctx) {
+  return {
+    name: "${name}",
+    desc: ${JSON.stringify(desc || "TODO: one line, ≤ 120 chars")},
+    run: (_argv, args) => {
+      // args._ is the remaining CLI tokens
+      process.stdout.write("${name}: not implemented\\n");
+    },
+  };
+}
+export default { register };
+`
+  );
+  process.stderr.write(`f uck: scaffolded ${dir}\n  edit index.js, commit + push in ${bucket}\n`);
 }
 
 export function register(ctx) {
@@ -289,6 +339,10 @@ export function register(ctx) {
       const [cmd, ...rest] = pos;
 
       switch (cmd) {
+        case "new": {
+          cmdNew(rest);
+          break;
+        }
         case "repo": {
           const sub = rest[0];
           if (sub === "add") {

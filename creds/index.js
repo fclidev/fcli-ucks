@@ -706,6 +706,46 @@ async function wait(name, { timeout = 300000, pollMs = 500, onPoll, by } = {}) {
   }
 }
 
+/**
+ * Typed error for the credsApi peer surface. Peers branch on `kind`, never on
+ * message text (contract §7). Message wording stays free to change.
+ *
+ *   kind: "locked"      daemon not running / key not in memory → `f creds unlock`
+ *   kind: "missing"     name not in the box and no provider has it
+ *   kind: "provider"    a provider's resolve() threw (availability failure)
+ *   kind: "other"       everything else
+ */
+export class CredsError extends Error {
+  /** @type {"locked"|"missing"|"provider"|"other"} */
+  kind;
+  /** provider name, for kind === "provider" */
+  provider;
+  constructor(kind, message, provider) {
+    super(message);
+    this.name = "CredsError";
+    this.kind = kind;
+    this.provider = provider;
+  }
+  static locked(msg) { return new CredsError("locked", msg ?? "creds locked"); }
+  static missing(name) { return new CredsError("missing", `no such cred: ${name}`); }
+  static provider(name, provider, msg) {
+    return new CredsError("provider", `provider '${provider}' failed: ${msg}`, provider);
+  }
+}
+
+/** Classify a thrown value from the credsApi ladder into a CredsError. */
+function toCredsError(name, e) {
+  if (e instanceof CredsError) return e;
+  const m = e?.message ?? String(e);
+  if (/locked/i.test(m)) return CredsError.locked(m);
+  if (/no such cred/i.test(m)) return CredsError.missing(name);
+  if (/^provider '/.test(m)) {
+    const p = m.match(/^provider '([^']+)' failed: (.*)$/);
+    return CredsError.provider(name, p?.[1] ?? "?", p?.[2] ?? m);
+  }
+  return new CredsError("other", m);
+}
+
 export function register(ctx) {
   return {
     name: "creds",
@@ -716,11 +756,13 @@ export function register(ctx) {
      *  providers are normally discovered from each uck's `credentialProvider`
      *  export via `f providers --dump` instead. */
     registerProvider,
-    // Programmatic entry for other ucks.
+    // Programmatic entry for other ucks. version: peers feature-detect on this
+    // (>=1: CredsError with .kind is thrown; message text is NOT an API).
     credsApi: {
+      version: 1,
       async get(name, ttl) {
         const state = unlockedState();
-        if (!state) throw new Error("creds locked");
+        if (!state) throw CredsError.locked();
         const r = await daemonCall({ op: "get", name }, state.socket);
         if (r.ok && r.value != null && r.value !== "") return r.value;
         // A sibling uck asking for a cred gets the same provider ladder the CLI
@@ -732,18 +774,18 @@ export function register(ctx) {
           isFresh: (n, t) => isMirrorFresh(n, t),
         });
         if (res.value != null) return res.value;
-        if (res.error) throw new Error(`provider '${res.provider}' failed: ${res.error}`);
-        if (res.none) throw new Error(r.error ?? `no such cred: ${name}`);
-        throw new Error(r.error ?? `no such cred: ${name} (no provider has it)`);
+        if (res.error) throw CredsError.provider(name, res.provider, res.error);
+        if (res.none) throw CredsError.missing(name);
+        throw toCredsError(name, new Error(r.error ?? `no such cred: ${name}`));
       },
       async set(name, value) {
         const state = unlockedState();
-        if (!state) throw new Error("creds locked");
+        if (!state) throw CredsError.locked();
         await daemonCall({ op: "set", name, value }, state.socket);
       },
       async ls() {
         const state = unlockedState();
-        if (!state) throw new Error("creds locked");
+        if (!state) throw CredsError.locked();
         const r = await daemonCall({ op: "ls" }, state.socket);
         return r.names ?? [];
       },
@@ -774,7 +816,7 @@ export function register(ctx) {
        *  to report where a token came from. */
       async resolve(name, opts = {}) {
         const state = unlockedState();
-        if (!state) throw new Error("creds locked");
+        if (!state) throw CredsError.locked();
         if (opts.noCache) clearMisses(name);
         if (!opts.localOnly && !opts.forceProvider) {
           const r = await daemonCall({ op: "get", name }, state.socket);
@@ -787,10 +829,10 @@ export function register(ctx) {
             isFresh: (n, t) => (opts.forceProvider ? async () => false : (n2, t2) => isMirrorFresh(n2, t2)),
           });
           if (res.value != null) return { value: res.value, source: res.mirror ? `vault (${res.mirror})` : `${res.provider}:${name}`, warning: res.warning };
-          if (res.error) throw new Error(`provider '${res.provider}' failed: ${res.error}`);
-          if (res.none) throw new Error(`no such cred: ${name} (${res.note})`);
+          if (res.error) throw CredsError.provider(name, res.provider, res.error);
+          throw CredsError.missing(name);
         }
-        throw new Error(`no such cred: ${name}`);
+        throw CredsError.missing(name);
       },
       /** Providers visible to creds, with { name, ready, note? }. */
       async providers() {
@@ -1405,4 +1447,4 @@ function usage(msg) {
   process.exit(1);
 }
 
-export default { register };
+export default { register, CredsError };

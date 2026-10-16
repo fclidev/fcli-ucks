@@ -17,7 +17,7 @@
 // The uck's index.js must also self-dispatch when Node runs it directly, so the
 // probe protocol works without importing the provider into the creds hot path:
 //
-//   uckMain(import.meta.url, main);   // from ../uckmain/index.js
+//   uckMain(import.meta.url, main);   // from ../lib/uckmain.js
 //   // main() handles: --dump | resolve <name> | has <name> | status
 //
 // `f providers --dump` is the machine-readable contract `f creds` reads. Every
@@ -104,6 +104,31 @@ export async function collect({ verbose } = {}) {
   return { found, skipped };
 }
 
+/**
+ * Probe self-test (G6-adjacent): a provider whose `index.js` is not a working
+ * CLI entry fails silently on first `f creds get` miss. Run `status` as a
+ * child (exactly what the readiness section does) and report the wiring
+ * problem at list time instead.
+ *
+ * Returns found[] with an extra `probe: "ok" | <problem string>` field.
+ */
+export async function checkProbes(found) {
+  const { execFileSync } = await import("node:child_process");
+  for (const p of found) {
+    try {
+      const out = execFileSync(process.execPath, [p.entry, "status"], {
+        encoding: "utf8", timeout: 20000, stdio: ["ignore", "pipe", "pipe"],
+      });
+      JSON.parse(out); // must be machine-readable
+      p.probe = "ok";
+    } catch (e) {
+      const m = String(e?.stderr || e?.message || e).split("\n")[0].slice(0, 120);
+      p.probe = m ? `probe failed: ${m}` : "probe failed";
+    }
+  }
+  return found;
+}
+
 export function register(_ctx) {
   return {
     name: "providers",
@@ -113,6 +138,7 @@ export function register(_ctx) {
       const dump = a.includes("--dump") || a.includes("--json");
       (async () => {
         const { found, skipped } = await collect({ verbose: !dump });
+        await checkProbes(found);
         if (dump) {
           process.stdout.write(JSON.stringify(found) + "\n");
           return;
@@ -122,7 +148,8 @@ export function register(_ctx) {
         } else {
           for (const p of found) {
             const ttl = p.mirrorTtlSec === undefined ? "-" : `${p.mirrorTtlSec}s`;
-            process.stdout.write(`${p.name}\tuck:${p.uck}\tmirrorTtl:${ttl}\n`);
+            const probe = p.probe && p.probe !== "ok" ? `\n  ⚠ ${p.probe}` : "";
+            process.stdout.write(`${p.name}\tuck:${p.uck}\tmirrorTtl:${ttl}${probe}\n`);
           }
           process.stdout.write(`ok\t${found.length} provider(s)\n`);
         }

@@ -1,10 +1,10 @@
 # The f ↔ uck contract
 
-**Status: PROPOSED v1 — pinning the current behavior of f 0.2.5.**
-Sections marked **PROPOSED** are normative going forward; sections marked
-**GAP** describe behavior that exists today but should change, with the change
-numbered (G1…G9) and the migration sketch given. This document is the diff-able
-baseline: read it top to bottom, resolve every GAP, and the contract is solid.
+**Status: v1 — implemented in f 0.3.0 (core) and the uck buckets (Oct 2026).**
+All GAPs G1–G10 are resolved as described below; the GAP register (§9) is kept
+as the change history. `credsApi.version: 1` is live (CredsError with `.kind`);
+peers in the personal bucket classify structurally with a message fallback for
+older creds builds. This document is the diff-able baseline for 1.0.
 
 What is **not** a contract and should stay out of it:
 
@@ -274,12 +274,17 @@ creds.credsApi = {
   That is string coupling to another uck's wording. Replace with a typed
   error: `class CredsError extends Error { kind: "locked"|"missing"|"provider"|"other"; provider?: string }`,
   and let callers branch on `err.kind`. Message text stays free to change.
-- **C3.** A peer that can't get `credsApi` (G6: registry absent, or the uck
-  not installed) must fall back to reading the creds **socket directly**
-  (path: `~/.f/.creds.sock`, JSON-line protocol) or report locked/missing in
-  its own status output. The socket protocol is *de facto* part of the
-  contract — **GAP G5: document it here** (ops: `get`/`set`/`has`/`ls`/`meta`/
-  `rm`, value as base64, `b64: true` flag, `expiresAt` for mirrors).
+- **C3.** A peer that can't get `credsApi` (registry absent, or the uck
+  not installed) must fall back to reading the creds **socket directly** or
+  report locked/missing in its own status output.
+- **C4. The creds socket protocol** (`~/.f/.creds.sock`, one JSON object per
+  request, one JSON reply). Ops: `get` (value, or base64 with `b64: true`),
+  `set` (value, optional `expiresAt` for mirrors), `has`, `ls`, `meta`, `rm`.
+  Replies: `{ ok: true, value? }` or `{ ok: false, error }`. The lockfile is
+  `~/.f/.creds-daemon` (`{ pid, start, ttl, socket }`); peers read it directly
+  for a non-blocking locked/unlocked check. Shared helpers: `fcli-ucks/lib/creds-error.js`
+  (`classifyCredsError`) and the personal bucket's `lib/credsresolve.js`
+  (`resolveCred` with reason codes `locked`/`unset`/`provider`/`wait-timeout`).
 
 ### 6.2 `uck` → `uckApi`
 
@@ -322,20 +327,24 @@ discovery surface.
 
 ## 9. GAP register — the change list, ordered
 
-| # | Change | Where | Effort | Blocks 1.0? |
+| # | Status | Original change | Where | Effort | Blocks 1.0? |
 |---|--------|-------|--------|-------------|
-| G1 | `ctx.fVersion` is the negotiation point; add uck `minF`, warn on mismatch | core | S | yes |
-| G2 | Enforce `desc` one-line + length cap in loader; add `about` for multi-line usage | core | S | yes |
-| G3 | Exit semantics: rule "failure = throw or non-zero `process.exitCode`"; loader rejects non-`undefined` returns (or maps to exitCode); document the `process.exit(0)`-on-failure ban | core | S | yes |
-| G4 | One `ctx` shape at register + run; add `ctx.uck(name)`; keep `registry` through 0.x, drop at 1.0 | core + all ucks | M | yes (1.0) |
-| G5 | Typed `CredsError` + `credsApi.version` + `providerVersion`; replace the `/locked/i` regex sites in ssh/gh/ha/fj; document the creds socket protocol in this doc | creds + 4 ucks | M | yes |
-| G6 | Published f must ship `registry` in run ctx; until then peers degrade gracefully (stated rule, §4) | core | S | yes |
-| G7 | Standardize `package.json` (`{"name","type":"module"}`); scaffold via `f uck new`; kill cross-bucket imports (ship `uckmain` per bucket or as npm pkg) | tooling + buckets | S | no |
-| G8 | Harness intercepts `--help`/`-h`/`help`: prints `desc` + `about` + uck `help` export if present; ucks may still override | core | S | no |
-| G9 | Warn on stderr on `name` collision (which bucket won) | core | XS | no |
-| G10 | One uck per directory (loader error on multi-register), or fix `self` semantics (dir path + `selfName`) | core + tooling | S | no |
+| G1 | ⌛ done in 0.3.0 | `ctx.fVersion` is the negotiation point; add uck `minF`, warn on mismatch | core | S | yes |
+| G2 | ⌛ done in 0.3.0 | Enforce `desc` one-line + length cap in loader; add `about` for multi-line usage | core | S | yes |
+| G3 | ⌛ done in 0.3.0 | Exit semantics: rule "failure = throw or non-zero `process.exitCode`"; loader rejects non-`undefined` returns (or maps to exitCode); document the `process.exit(0)`-on-failure ban | core | S | yes |
+| G4 | ⌛ done in 0.3.0 (ctx.uck + unified shape; registry alias removal is the 1.0 break) | One `ctx` shape at register + run; add `ctx.uck(name)`; keep `registry` through 0.x, drop at 1.0 | core + all ucks | M | yes (1.0) |
+| G5 | ⌛ done — CredsError + credsApi.version=1 in creds; peers classify structurally (msg fallback kept) | Typed `CredsError` + `credsApi.version` + `providerVersion`; replace the `/locked/i` regex sites in ssh/gh/ha/fj; document the creds socket protocol in this doc | creds + 4 ucks | M | yes |
+| G6 | ⌛ done in 0.3.0 (registry always shipped) | Published f must ship `registry` in run ctx; until then peers degrade gracefully (stated rule, §4) | core | S | yes |
+| G7 | ⌛ done — package.json standardized, `f uck new` scaffolds, uckmain copied per bucket, doc path fixed | Standardize `package.json` (`{"name","type":"module"}`); scaffold via `f uck new`; kill cross-bucket imports (ship `uckmain` per bucket or as npm pkg) | tooling + buckets | S | no |
+| G8 | ⌛ done in 0.3.0 (bare-help only; fall-through when no help/about export) | Harness intercepts `--help`/`-h`/`help`: prints `desc` + `about` + uck `help` export if present; ucks may still override | core | S | no |
+| G9 | ⌛ done in 0.3.0 | Warn on stderr on `name` collision (which bucket won) | core | XS | no |
+| G10 | ⌛ done in 0.3.0 | One uck per directory (loader error on multi-register), or fix `self` semantics (dir path + `selfName`) | core + tooling | S | no |
 
-**Suggested cut:** G1+G2+G3+G6+G9 as one core **minor** (0.3, additive);
+**Implemented cut (Oct 2026):** core 0.3.0 ships G1/G2/G3/G6/G8/G9/G10;
+creds ships G5 (CredsError, `credsApi.version: 1`); the uck buckets ship G7. **Remaining for 1.0:**
+removal of the `registry` alias (G4) once no peer uses it directly.
+
+**Original suggested cut:** G1+G2+G3+G6+G9 as one core **minor** (0.3, additive);
 G5 as creds **minor** (back-compat: old message matching still works until
 peers migrate); G4+G8+G10 as **1.0** (breaking: ctx shape, help
 interception, one-uck-per-dir). G7 anytime.
