@@ -1,8 +1,7 @@
 {
-  "name": "@fcli/uck-config",
-  "version": "0.1.0",
-  "description": "f uck: edit f.config.json via JSONPath",
+  "name": "fcli-ucks-config",
   "type": "module",
+  "description": "f uck: edit f.config.json via JSONPath",
   "main": "index.js",
   "dependencies": {
     "jsonpath-plus": "^11.2.0"

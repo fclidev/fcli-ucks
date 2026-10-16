@@ -1,7 +1,6 @@
 {
-  "name": "@fcli/uck-creds",
-  "version": "0.1.0",
-  "description": "f uck: store credentials (scrypt+AES-GCM, daemon+socket, ttl)",
+  "name": "fcli-ucks-creds",
   "type": "module",
+  "description": "f uck: store credentials (scrypt+AES-GCM, daemon+socket, ttl)",
   "main": "index.js"
 }

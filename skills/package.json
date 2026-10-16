@@ -1,5 +1,4 @@
 {
-  "name": "skills",
-  "type": "module",
-  "private": true
+  "name": "fcli-ucks-skills",
+  "type": "module"
 }

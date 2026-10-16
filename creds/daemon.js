@@ -83,6 +83,22 @@ function decValue(key, entry) {
   return Buffer.concat([decipher.update(Buffer.from(entry.data, "base64")), decipher.final()]);
 }
 
+// Verify the derived key before serving anything. AES-GCM auth is all-or-nothing
+// per key, so the first well-formed entry settles it. A fresh/empty box has
+// nothing to check and starts regardless.
+function verifyKey(key, box) {
+  for (const e of Object.values(box.entries)) {
+    if (!e?.nonce || !e?.tag || !e?.data) continue;
+    try {
+      decValue(key, e);
+      return { ok: true };
+    } catch {
+      return { ok: false };
+    }
+  }
+  return { ok: true, empty: true };
+}
+
 // base64 is a single JSON token, so a raw value can't word-wrap in terminal
 // scrollback into something un-decodable.
 function b64(buf) {
