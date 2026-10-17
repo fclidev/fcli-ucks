@@ -1,3 +1,4 @@
 .f-source.json
 package-lock.json
 dist/
+*.tgz
