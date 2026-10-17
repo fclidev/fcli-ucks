@@ -122,7 +122,49 @@ and the error path would then disagree about which store is authoritative).
 > *protection* is already adequate (dirty buckets are skipped; non-TTY stdin
 > counts as "no"; `--force` aborts rather than discarding).
 >
-> **Pick one before 1.0.** The current state is the worst of both: the docs
+> **Pick one before 1.0.**>
+> **Recommendation (0.3.1): keep `reset --hard`, and fix the skill.** Not the
+> `.f-dirty` marker sketch. Three reasons, one of them measured:
+>
+> 1. **The marker does not cover the loss that actually matters.** A dirty tree is
+>    already protected — `upBucket()` *skips* a bucket with a dirty or non-default
+>    branch, and `--force` refuses rather than discarding. What is not protected is
+>    a **committed but unpushed** edit: the tree is clean, so it is not skipped, and
+>    `reset --hard origin/main` deletes the only copy of that commit. Measured on a
+>    throwaway clone: local `6993913` → after reset `8121d94`, the commit unreachable.
+>    A dirty-worktree marker is blind to it by construction, because there is
+>    nothing dirty.
+> 2. **The author already pushes.** The published skill's own workflow is
+>    `f uck push`, and that is what was used for every uck change in this repo. Once
+>    the edit is pushed, `reset --hard` is a no-op. The failure needs the author to
+>    stop at exactly the step the skill says to do next — and step 4 of the same
+>    skill already warns "unpushed edits in the store are wiped on the next update".
+>    So the docs are not wrong, only buried: the model reads them while authoring,
+>    and f's output while running.
+> 3. **A `.f-dirty` marker is not a commit graph.** It cannot tell a stash-worthy
+>    edit from a generated file or a stray `node_modules`, and the "commit first,
+>    then wipe" recovery it enables writes to the author's repo as a side effect of
+>    a command whose documented job is to *update*. Core would grow permanent state
+>    and a recovery UI to serve a workflow it also advises against — against
+>    "keep core f simple".
+>
+> **Cheaper than the marker, and worth doing regardless** (none of it changes the
+> contract):
+> - `f up` should say why it skipped a bucket, and name the unpushed case
+>   explicitly: *"2 commits not on origin — `f uck push` first"*. Today a skip is
+>   silent unless verbose, so the author learns from the damage.
+> - `f uck check` should warn when a bucket has commits ahead of its upstream.
+>   That catches the loss *before* the next `f up`, in the tool the author already
+>   runs while editing.
+> - One sentence at the top of the skill's "Where it lives": *the bucket is a
+>   working tree, but `f up` resets it to origin — commit is not enough, push*.
+>
+> **If the owner instead decides buckets are authoritative editing surfaces**, then
+> `reset --hard` has to go entirely (fetch + fast-forward only, refuse to diverge)
+> — that is coherent too, but it is a bigger change than the marker, and it makes
+> `f up` unable to recover a bucket the author has rebased. Say which; do not leave
+> the two documents contradicting each other.
+ The current state is the worst of both: the docs
 > encourage the thing the tool will discard.
 ### C1 — `f up` can destroy a bucket, and a local source can corrupt one
 
