@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from "node:fs";
+import { join, dirname, resolve, isAbsolute, sep } from "node:path";
 
 const require = createRequire(import.meta.url);
 const { JSONPath } = require("jsonpath-plus");
@@ -43,6 +43,66 @@ function parseValue(raw) {
   }
 }
 
+/**
+ * A uck source that points into the store, or null. Checked at the moment the
+ * source is written, not when `f up` later tries to install it.
+ *
+ * Core refuses to install such a source: installing it copies a tree into
+ * itself, and the copy partly lands before the failure — which is how one
+ * mistyped path deleted `config/*` and `lib/*` from an author's own bucket and
+ * left it claiming to be a clone of another repo. Seeing that here, on
+ * `f config add`, beats seeing it during a later `f up`.
+ *
+ * Git URLs, npm specs and anything else that is not a filesystem path are
+ * untouched, and only the realpath is compared — a source that merely shares a
+ * label with a store ancestor is a name collision (ROADMAP C5), not a self-copy,
+ * so it stays allowed.
+ */
+function insideStore(specifier) {
+  if (typeof specifier !== "string" || !specifier) return null;
+  if (/^(git\+|file|https?|ssh|ftps?):\/\//i.test(specifier)) return null;
+  if (specifier.startsWith("github:") || specifier.startsWith("git@")) return null;
+  const looksLikePath =
+    specifier.startsWith(".") || specifier.startsWith("/") || specifier.startsWith("~");
+  if (!looksLikePath) return null; // an npm spec
+  const expanded =
+    specifier.startsWith("~") ? join(process.env.HOME ?? "", specifier.slice(1)) : specifier;
+  let abs;
+  try {
+    abs = realpathSync(isAbsolute(expanded) ? expanded : resolve(process.cwd(), expanded));
+  } catch {
+    return null; // unresolvable here; core reports it at install time
+  }
+  let store;
+  try {
+    store = realpathSync(join(process.env.HOME ?? "", ".f", "ucks"));
+  } catch {
+    return null; // no store yet: nothing can be inside it
+  }
+  return abs === store || abs.startsWith(store + sep) ? abs : null;
+}
+
+/**
+ * Refuse to write a config whose uck sources point into the store. Throws
+ * instead of writing, so the file is never left describing an uninstallable
+ * source. NOTE: this guards the config only. Whether authors may *edit* store
+ * buckets is a separate, unresolved question — see ROADMAP-1.0.md C1(b).
+ */
+function assertSourcesUsable(doc) {
+  const list = Array.isArray(doc?.ucks) ? doc.ucks : Array.isArray(doc?.extensions) ? doc.extensions : [];
+  const sources = list
+    .map((s) => (typeof s === "string" ? s : typeof s?.source === "string" ? s.source : null))
+    .filter(Boolean);
+  const bad = sources.filter(insideStore);
+  if (bad.length === 0) return;
+  const store = join(process.env.HOME ?? "", ".f", "ucks");
+  throw new Error(
+    `uck source(s) point into the store (${store}):\n  ${bad.join("\n  ")}\n` +
+      `A store bucket is a cache that f overwrites; a source inside it means copying a tree over itself.\n` +
+      `Add an external path instead (a clone you made), or push and add the git URL.`
+  );
+}
+
 /** Core ops. target: "project" | "global" | explicit path. */
 const configApi = {
   /** Read the whole doc (or a path). Returns the natural value (no extra array wrap). */
@@ -62,6 +122,7 @@ const configApi = {
     const doc = readDoc(file);
     const val = parseValue(String(value));
     applySet(doc, path, val);
+    assertSourcesUsable(doc);
     writeDoc(file, doc);
     return val;
   },
@@ -72,6 +133,7 @@ const configApi = {
     const doc = readDoc(file);
     const val = parseValue(String(value));
     applyAdd(doc, path, val);
+    assertSourcesUsable(doc);
     writeDoc(file, doc);
     return val;
   },
