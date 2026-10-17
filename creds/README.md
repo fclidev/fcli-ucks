@@ -104,11 +104,6 @@ resolved lazily on the first local miss.
   status?(): { ready, note?, hint? } | Promise<…>, // for `f creds status`
   mirrorTtlSec?: number,               // floor before a mirrored hit is revalidated
                                        //   0 = revalidate every time
-  hasExternalApi?: boolean,            // default true. false = EXCLUDED from discovery
-                                       //   (checked in providers.js only) — it does NOT
-                                       //   mean "no network needed"; do not confuse it
-                                       //   with `has()`, and note `f providers` output
-                                       //   reflects registration, not this flag
 }
 ```
 

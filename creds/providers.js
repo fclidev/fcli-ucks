@@ -158,7 +158,10 @@ function fromChildProcess(stdout) {
     throw new Error(`providers --dump emitted unparseable JSON (${String(stdout).slice(0, 80)})`);
   }
   return (Array.isArray(obj) ? obj : [obj])
-    .filter((p) => p && typeof p.name === "string" && p.hasExternalApi !== false)
+    // Presence of a name IS discovery (CONTRACT.md P8). `hasExternalApi` was
+    // removed: there is no opt-out, and a uck that should not be probed
+    // should not carry credentialProvider at all.
+    .filter((p) => p && typeof p.name === "string")
     .map((p) => ({
       name: p.name,
       canWrite: p.canWrite === true,   // advertised by the provider; gates `creds set` dual-write

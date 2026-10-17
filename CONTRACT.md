@@ -42,20 +42,47 @@ bucket/
   commands that never touch that uck. No network, no file writes, no prompts,
   no daemons at import time. All work happens in `register()`-return values
   that are *called* later, or in `run()`.
-- **N4.** A uck may import sibling files in its own directory. Cross-bucket
-  imports are forbidden (today `vaultwarden` imports
-  `../../fcli-ucks/lib/uckmain.js` — *GAP G7: this breaks the moment the two
-  buckets land in different store layouts; ship `uckmain` per bucket or in a
-  shared npm package*). Note `providers/index.js` documents the path as
-  `lib/uckmain/index.js` while the file is `lib/uckmain.js` — docs and code
-  already disagree; G7 should fix the path too.
+- **N4.** A uck may import **sibling files in its own directory**
+  (`./helper.js`) — that is the sanctioned sharing mechanism, and each
+  bucket's `lib/` exists for exactly that. Three things are **forbidden**:
+  - `../..` — reaching outside your own uck directory. Breaks under bucket
+    flattening, and under a local-source copy that omits `lib/` (observed:
+    a local copy of this bucket loaded 8/10 ucks and printed
+    `Cannot find module '…/lib/uckmain.js'` on **every** command).
+  - reaching a **sibling bucket** by store path (`../../<other-bucket>/lib/…`)
+    — bucket dir names are derived from source URLs (§1, `sourceBucket`), so
+    that is a dependency on a naming scheme, not an API;
+  - reaching a sibling bucket via `ctx.registry["other-uck"]` **and then
+    importing from its directory**. The registry carries behaviour, never
+    paths, and must never become an import-resolution mechanism.
+
+  **Shared code across buckets has exactly two legal homes:**
+  1. **copy it into each bucket's `lib/`** — the default for small helpers.
+     `lib/uckmain.js` is byte-identical in both installed buckets today; that
+     is intentional duplication, not drift; or
+  2. **an npm package** declared in each bucket's own uck `package.json`, when
+     the code is large enough that duplication is worse than a dep.
+
+  Copying has one consequence a provider author must know: the probe protocol
+  runs `node <uck>/index.js …` with `node_modules` resolved **from the uck
+  directory**, so a bucket-level `lib/` is unreachable there and an npm import
+  only works if installed *under that uck*. A shared helper consumed by a uck
+  whose `index.js` doubles as a CLI entry (all providers) must be **copied into
+  the uck directory itself**, or the uck must carry its own installed deps —
+  see §5 P7.
+
+  *Fixed here:* `providers/index.js` documented the path as
+  `lib/uckmain/index.js`; the file is `lib/uckmain.js`. Both now say
+  `../lib/uckmain.js`, which is also what `vaultwarden` and `providers`
+  actually import.*
 - **N5.** `f` installs a uck's declared dependencies (from its
   `package.json`) into the uck's own `node_modules`, and runs the uck **in
   place** — bare specifiers resolve from the uck's directory. A uck is
   therefore portable: same code, same `node_modules`, no global installs.
 - **N6.** The uck directory name and the registered uck `name` are *not
   required to match* (the loader keys on the registered name). They should
-  match; `f uck` tooling enforces it. *(GAP G10: see §4 P10.)*
+  match; `f doctor` reports a mismatch (ROADMAP C3 — the loader keys on the
+  registered name, so a mismatch is silent today). *(GAP G10, §9.)*
 
 ## 2. The uck module — `register(ctx)`
 
@@ -80,10 +107,10 @@ export default { register };                              // f uses mod.default 
 ```js
 {
   name: "myuck",              // REQUIRED. string. The dispatch key: `f myuck …`.
-  desc: "one line, ≤ 100 ch", // REQUIRED in practice (f help + skill search).
+  desc: "one line, ≤ 120 ch", // REQUIRED in practice (f help + skill search).
   run: (argv, args, ctx) => …,// REQUIRED. May be sync or async.
   argv?: (rest) => argsObj,   // OPTIONAL. Overrides arg parsing (see §2.3).
-  about?: "longer usage",     // GAP G2 (new field).
+  about?: "longer usage",     // OPTIONAL. Multi-line usage for LLMs (see N10, N16).
   skills?: [{ name, path }],  // OPTIONAL. Self-registered skills (see §6.3).
   credentialProvider?: { … }, // OPTIONAL. Credential provider (see §5).
   <any other key>,            // ALLOWED. Peer API surface (see §5/§6).
@@ -94,15 +121,18 @@ export default { register };                              // f uses mod.default 
   set. **Duplicates: last-loaded wins, silently.** Load order is
   store-buckets (alphabetical, first-bucket-wins for dir collisions) then
   npm sources in config order, overwriting the map. *(GAP G9: warn on stderr
-  when a name is overwritten and by which bucket.)*
+  when a name is overwritten and by which bucket — the current message,
+  `f: uck '<name>' shadowed (store) by a later source`, cannot name the
+  winner; see ROADMAP C5.) *
 - **N10.** `desc` is consumed by `f help`, `ctx.ucks`, and skill search.
-  One line, no newlines. *(GAP G2: enforce length cap in the loader —
-  truncate with `…` — and add `about` for the multi-line, LLM-audience text
-  that `f <uck> --help` should print.)*
+  One line, no newlines. **The cap is 120 characters** — that is what the
+  loader clamps with `…`, and what `f uck new` scaffolds. (100 was an earlier
+  draft value; `about` carries the multi-line, LLM-audience text that
+  `f <uck> --help` prints.)
 - **N11.** Unknown keys on the uck object are allowed and are the intended
   mechanism for peer APIs (§5, §6). f itself ignores them.
-- **N12.** *(GAP G1: new field)* `minF?: string` — minimum f semver the uck
-  requires. f warns (stderr, once) when `fVersion < minF` and still loads the
+- **N12.** `minF?: string` — minimum f semver the uck requires. f warns
+  (stderr, once) when `fVersion < minF` and still loads the
   uck. This is the last cheap window to add version negotiation.
 
 ### 2.2 `run(argv, args, ctx)`
@@ -112,26 +142,32 @@ export default { register };                              // f uses mod.default 
     (`string[]`).
   - `args`: parsed form, `{ _: string[], …flags }` when no `argv` hook is
     defined (§2.3).
-  - `ctx`: the same object as at register time, plus `registry` (§3).
+  - `ctx`: the same object as at register time (§3).
 - **N14.** `run` may be sync or async. f `await`s the return value.
 - **N15. Exit semantics.**
   - `run` returns normally with `undefined` → exit 0.
   - `run` throws → f prints `f: <message>` on stderr, exit 1.
-  - A numeric return value is **ignored** by the harness. *(GAP G3: make the
-    loader reject non-`undefined` returns in a dev build, or interpret
-    non-zero numbers as `process.exitCode`. Either way, document one rule.)*
-  - **A uck may set `process.exitCode` directly and that is respected.** A uck
-    calling `process.exit(n)` also works but bypasses the harness error
-    handler. The *forbidden* pattern is `process.exit(0)` on a failure path —
-    the harness cannot see it. *(GAP G3: this exact bug has shipped twice in
-    `creds`; the rule "failure = throw or non-zero `process.exitCode`, never
-    a quiet return" must be in the contract and the scaffolder.)*
+  - A numeric return value is interpreted as `process.exitCode` when
+    non-zero; `undefined` means 0. Any other return type is a bug in the uck.
+  - **A uck may set `process.exitCode` directly and that is respected.**
+    **Prefer `return n` / `process.exitCode = n` over `process.exit(n)`:** the
+    harness terminates the unknown-uck and post-throw paths with
+    `process.exit(1)`, which discards buffered stdout — so a uck that printed
+    a large report and then threw loses the report, and "how much of a secret
+    reached stdout" becomes undefined. The *forbidden* pattern stays
+    `process.exit(0)` on a failure path — the harness cannot see it. This bug
+    has shipped twice in `creds`.
+    The rule, once: **failure = throw, or non-zero exit via return. Never a
+    quiet return.**
 - **N16. Help.** `f <uck> --help` / `-h` / `help` are **not** intercepted by
   the harness; the tokens pass through to `run` and the uck implements its own
   usage text. Every uck that accepts subcommands must treat a bare call (no
-  args) and `--help`/`-h`/`help` as usage, printing to **stdout**. *(GAP G8:
-  consider harness-side interception that prints `desc` + `about` + an
-  optional uck-exported `help` string, so ucks stop re-implementing it.)*
+  args) and `--help`/`-h`/`help` as usage, printing to **stdout**. **The
+  harness intercepts help only when the uck is called with no args, or with
+  exactly one of `--help` / `-h` / `help`, and the uck exported `help` or
+  `about`** — then it prints `desc` + `help ?? about` to stdout and `run`
+  never executes. Every other token passes through untouched, so exporting
+  `about` is what makes `f <uck> --help` work without a parser branch.
 - **N17. Stdout is the answer; stderr is diagnostics.** Errors go to stderr
   (the harness's own error lines do too). Secrets must never be printed
   without an explicit flag (the `--secrets` convention in `creds`).
@@ -147,25 +183,77 @@ and is therefore at risk of drifting.)*
 
 ## 3. `ctx`
 
-- **N18.** At **register time**: `ctx = { fVersion, self }`.
+- **N18.** At **register time**: `ctx = { fVersion, contractVersion, self,
+  ucks, registry }`.
   - `fVersion`: `string`, the installed f semver.
+  - `contractVersion`: `number` — **A2, implemented.** The f↔uck contract
+    version this core implements (core exports `CONTRACT_VERSION`, currently
+    `1`). A uck written against the 1.0 ctx must be able to tell a 1.0 core
+    from a future one that drops a key this ctx still carries; `fVersion`
+    cannot answer that, being a core release number and not an interface one.
   - `self`: `string`, the uck's **registered name** (i.e. what `f <self>`
     invokes). For a directory registering multiple ucks this is *wrong* for
     all but the first — *(GAP G10: guarantee one uck per directory, or
     pass the directory path as `self` and add `selfName` for the registered
     name.)*
-- **N19.** At **run time**: `ctx = { fVersion, self, ucks, registry }`.
-  - `ucks`: `[{ name, desc }]` for every registered uck — the same data
-    `f help` prints. Intended for LLM-facing discovery, cheap to include.
-  - `registry`: `Map<string, uckObject>` — every registered uck object,
+  - `ucks` / `registry`: present here too (G4) — register-time and run-time are
+    **one shape**, one ctx to learn. See N20a for the partial-view caveat,
+    which is the only real constraint.
+- **N19.** At **run time**: `ctx = { fVersion, contractVersion, self, ucks,
+  registry }` — identical keys to register time (N18). Core builds both from
+  one shape, so they cannot drift apart.
+  - `ucks`: `[{ name, desc }]` for every registered uck — **the full set**, not
+    the previously-registered subset — i.e. the same data `f help` prints.
+    Intended for LLM-facing discovery, cheap to include.
+  - `registry`: **plain object** (not a `Map`) of every registered uck object,
     keyed by name. This is the **only** sanctioned way to reach another uck's
     peer API.
-- **N20. (GAP G4: new)** The two ctx shapes should be **one** shape.
-  Register-time will gain `ucks`/`registry` (available, since all ucks are
-  registered before any is dispatched), and a helper
-  `ctx.uck(name) → uckObject | undefined` replaces direct
-  `ctx.registry.creds.credsApi` duck-typing. `registry` remains as a
-  read-only property through 0.x, removed at 1.0.
+- **N20. `ctx.registry` is the one peer accessor. `ctx.uck(name)` is deleted —
+  no deprecation cycle.** *(A1, implemented: the key is absent from both ctx
+  objects, so a uck still calling it fails loud rather than degrading to a
+  socket fallback.)* `uck()` shipped in 0.3.0 as sugar over
+  `registry[name]` (a closure over the same map, so both returned
+  **identical object identities**). Adoption decided this: of six in-tree peer
+  accesses, **five already used `registry`** (`skills`, `fj`, `ha`, `ha-ws`,
+  `ssh`) and exactly one used `uck()` (`gh`). The superset won on its own, and
+  it strictly dominates:
+  - `registry[name]` subsumes `uck(name)`; "filter `uck()` instead" is not
+    isolation, since peer objects are unsandboxed and a proxy hides key names,
+    not powers;
+  - load order is contract-relevant (N9 shadowing/last-wins; §6.3 skill
+    merging spans every uck) and only the map answers "what did I shadow?";
+  - `registry` is the only one that can exist at register time (N20a).
+
+  Pre-1.0 breaking changes need no migration handling, and the failure mode is
+  loud anyway: `ctx.uck("creds")` → `f: ctx.uck is not a function`.
+
+  #### Migration (one call site, in-tree)
+
+  ```diff
+  - const credsApi = ctx?.uck?.("creds")?.credsApi ?? null;
+  + const credsApi = ctx?.registry?.creds?.credsApi ?? null;
+  ```
+
+  **`?.` guards the call, not the result.** A uck left reading
+  `ctx.uck?.("creds")` does *not* fail loudly: it yields `undefined`, degrades
+  to the §6.1 C3 socket fallback, and reports `no-store` — which reads to a
+  user as "no credential configured". **A half-migrated uck is worse than an
+  unmigrated one.** Audit any bucket before bumping:
+  `grep -rn "\.uck(" --include=*.js . | grep -v node_modules`
+- **N20a.** `registry` is **read-only by convention** — do not mutate it, add
+  keys, or delete a peer; registration happens only via `register()`. Nothing
+  enforces this in 0.x; mutation is unsupported.
+
+  At **register time** `registry` is a **partial view**: only ucks loaded
+  before yours are present (imports proceed in store order and `register()`
+  runs during that walk). Use it there for *feature detection* only —
+  `"creds" in ctx.registry` — never for an authoritative peer lookup. Reach
+  peers for real in `run`, where the view is complete.
+- **N20b.** `ctx` and everything reachable from it must be
+  **structured-cloneable** — no sockets, child processes, open fds, or class
+  instances with private fields hung off it. Providers are spawned as children
+  (§5 P4/P5), so anything a provider needs must survive that boundary. The
+  rule applies to `ctx`'s **fields**.
 - **N21.** `ctx` is **not** an environment. Ucks that need config read
   `f.config.json` themselves (project, walking up ≤6–8 dirs, then
   `~/.f/f.config.json`) — the convention is a JSON object with a top-level
@@ -211,7 +299,6 @@ A provider is a uck object that additionally carries `credentialProvider`:
   has?: (name) => boolean,         // OPTIONAL pre-filter — see the trap below.
   status?: () => readiness,        // OPTIONAL. { ready, note?, hint? }.
   mirrorTtlSec?: number,           // OPTIONAL. Floor on mirror freshness.
-  hasExternalApi?: boolean,        // OPTIONAL. false = excluded from discovery.
   blurb?: string,                  // DOCUMENTED-ONLY. Read by nothing.
 }
 ```
@@ -242,21 +329,37 @@ A provider is a uck object that additionally carries `credentialProvider`:
   never prompt (throw instead); pass `F_CREDS_NO_PROVIDER=1` through when
   shelling out to `f` (recursion guard); never put secrets in `argv` (providers
   are spawned as children).
-- **P6. (GAP G5: new)** The provider interface needs a **version tag**
-  (`providerVersion?: 1`) and the caller (creds) should feature-detect rather
-  than string-match. See §7.
+- **P6.** The provider interface carries a **version tag**
+  (`providerVersion?: 1`) and the caller (creds) **feature-detects** it rather
+  than string-matching. Untagged = pre-v1: it may throw untyped errors, so the
+  caller keeps its message-matching fallback. See §7.
+  *Not yet implemented in either bucket — `providerVersion` appears in zero
+  files today, which is why `creds` still carries the `/locked/i` fallback.*
+- **P7.** **A provider may not share code with another bucket** (N4), and the
+  probe transport makes this concrete: `node <uck>/index.js …` resolves
+  `node_modules` **from the uck directory**, so a bucket-level `lib/` import
+  works when f imports the module in-process and **breaks when the same module
+  is spawned as a probe child**. Providers must copy helpers into their own
+  directory, or declare deps in their own `package.json`.
+- **P8.** `hasExternalApi` (was: `false` = excluded from discovery) is
+  **removed** — pre-1.0 breaking change, no shim. Presence of
+  `credentialProvider.name` **is** discovery; there is no opt-out, and if a
+  uck should not be probed it should not carry `credentialProvider`. Sites to
+  delete: `providers/index.js` (`hasExternalApi: true`),
+  `creds/providers.js` (the `!== false` filter), `vaultwarden/index.js`
+  (the `--dump` row).
 
 ## 6. Peer APIs (informal, registry-based)
 
 Anything beyond §5. A uck may expose any data or functions on its registered
-object; peers read them via `ctx.registry` (G4: `ctx.uck(name)`). Two exist
-today:
+object; peers read them via `ctx.registry` (N20 — the sole accessor).
+Two exist today:
 
 ### 6.1 `creds` → `credsApi`
 
 ```js
 creds.credsApi = {
-  version?: 1,                  // GAP G5 (new)
+  version?: 1,                  // §7.2: gates whether `kind` is guaranteed
   get(name, ttl?),              // → value; throws CredsError (G5) or Error
   set(name, value),
   ls(),                         // → [names]
@@ -271,9 +374,10 @@ creds.credsApi = {
 - **C2. (GAP G5 — the worst coupling in the tree today)** Peers currently
   distinguish locked/missing by **regexing the error message**
   (`/locked/i.test(msg)`, `/no such cred/i.test(msg)`) in ssh, gh, ha, fj.
-  That is string coupling to another uck's wording. Replace with a typed
-  error: `class CredsError extends Error { kind: "locked"|"missing"|"provider"|"other"; provider?: string }`,
-  and let callers branch on `err.kind`. Message text stays free to change.
+  That is string coupling to another uck's wording. Branch on structure
+  instead — `err.kind`, vocabulary in §7.2. **`kind` is the contract; the
+  `CredsError` class is not** (§7.3): never `instanceof` it from another uck,
+  and never import it from a sibling bucket (that would also violate N4).
 - **C3.** A peer that can't get `credsApi` (registry absent, or the uck
   not installed) must fall back to reading the creds **socket directly** or
   report locked/missing in its own status output.
@@ -284,12 +388,25 @@ creds.credsApi = {
   `~/.f/.creds-daemon` (`{ pid, start, ttl, socket }`); peers read it directly
   for a non-blocking locked/unlocked check. Shared helpers: `fcli-ucks/lib/creds-error.js`
   (`classifyCredsError`) and the personal bucket's `lib/credsresolve.js`
-  (`resolveCred` with reason codes `locked`/`unset`/`provider`/`wait-timeout`).
+  (`resolveCred`). Both are **duplicated per bucket by design** (N4/P7), and
+  both must translate into the §7.2 vocabulary — their private reason codes are
+  implementation detail, not interface (see the retired-vocabulary table).
 
-### 6.2 `uck` → `uckApi`
+### 6.2 `uck` → `uckApi` (informative — not yet a stable surface)
 
-`{ loadTargets, saveTargets, push, bucketUcks }` — push-store targets.
-Internal to the default bucket; document in the uck uck, not here.
+`{ loadTargets, saveTargets, push, bucketUcks }` — the push-side twin of §1/§4.
+Two properties to know before depending on them:
+
+- **Target name = bucket name = store directory.** `push` reads
+  `~/.f/ucks/<bucket>/` and the target's `name` selects the work clone at
+  `~/.f/uck-work/<name>/`. A mismatch does not error — it pushes the wrong
+  directory, or nothing.
+- **`f uck new`'s default bucket** is the first `f.repo.json` `targets` entry
+  whose store dir is a git clone. With more than one target that is an ordering
+  accident; pass `--bucket` whenever it matters.
+
+Push semantics (rebase by default, conflict ⇒ abort and report, `--no-rebase`
+for store-wins) stay in the `uck` uck's own README.
 
 ### 6.3 Skills — uck-registered
 
@@ -301,15 +418,93 @@ frontmatter `name:`/`description:`. **S1.** A uck registering a skill should
 also document it in its `desc` or `about`, because `f help` is the primary
 discovery surface.
 
-## 7. Error contract (GAP G5 summary)
+**S2. `skills[].path` is the one field on a uck object that must be an
+absolute path**, and it is always built from the uck's own location:
+
+```js
+const here = path.dirname(fileURLToPath(import.meta.url));
+skills: [{ name: "f-myuck", path: path.join(here, "SKILL.md") }]
+```
+
+Deliberately **not** `ctx.self` — `self` is the *registered name*, not a
+filesystem path, and using it would break the moment dir and registered name
+ diverge (N6).
+
+Why it is absolute: this is the same expression the `uckMain` guard uses
+(`isMain` compares `pathToFileURL(realpathSync(argv[1])).href` to
+`import.meta.url`), so **one `here` constant serves both the skill path and
+the probe entry point** — and it stays correct under the two layouts that
+break naive paths: the git-bucket layout (`<bucket>/<uck>/`) and the
+local-source layout, which flattens to `<bucket>/` (N4, §7.3). A relative
+`path` would be resolved against the *reader's* cwd, and the skills uck reads
+these from a different process than the one that registered them.
+
+## 7. Error contract
+
+### 7.1 The rules
 
 - Ucks throw to signal failure (N15); the harness prints + exits 1.
 - Peer-to-peer: **no string matching on another uck's error messages.**
   Structured results or typed errors only (§6.1 C2, §5 P6).
 - Every uck that can fail on an external system (network, daemon, lock)
-  should expose a `status`-style subcommand reporting *why*, so the failure
-  is diagnosable without re-running the failing call (creds, ha, fj, gh all
-  do; make it a stated convention).
+  should expose a `status`-style subcommand reporting *why*, so the failure is
+  diagnosable without re-running the failing call (creds, ha, fj, gh all do;
+  a stated convention).
+
+### 7.2 `CredsKind` is the wire vocabulary (normative)
+
+```ts
+type CredsKind =
+  | "locked"    // store locked → `f creds unlock`. NOT the same as missing.
+  | "missing"   // unlocked; no local value and no provider hit
+  | "provider"  // a provider was reached and failed (`.provider` names it)
+  | "no-store"  // creds uck absent/unreachable; even the socket read failed
+  | "timeout";  // a bounded wait elapsed (credsApi.wait)
+```
+
+A consumer must handle all five. **`locked` and `missing` are different
+failures with different fixes** and must never collapse into one branch (C1).
+`version` / `providerVersion` gate the *guarantee*: below v1 kinds are
+best-effort (caller keeps message matching), at/above v1 they are thrown and
+total.
+
+**Retired vocabulary.** Three incompatible mappings were built over the same
+underlying states; they are **not** interface. A helper may use one internally
+and must translate at its boundary; callers must not spread the alias:
+
+| retired | where it came from | now |
+|---|---|---|
+| `unset` | `credsresolve.js` reason | `missing` |
+| `wait-timeout` | `credsresolve.js` reason | `timeout` |
+| `no-names` | `credsresolve.js` reason | caller bug — built no names, make no call |
+| `error` | `classifyCredsError` bucket | `provider` / `no-store` / `other` |
+| `""` (empty reason) | `credsresolve.js` | success, or `missing` |
+
+`"other"` stays legitimate **only** for a uck's own internal catch-all. A
+credential failure reported *to a user* must name one of the five kinds with
+its fix; "something went wrong: other" is not a diagnosis.
+
+### 7.3 `CredsError` the class is not the contract
+
+The throw site already upholds this and should keep doing so: `lookupCred`
+catches and re-throws a plain `{kind, message, provider}` without importing the
+class, and `credsApi.get` re-throws the original `kind` rather than
+reconstructing. Good shape — because the class has a **module-identity hazard**:
+
+`CredsError` lives in `creds/index.js`, reachable two ways — the harness's
+`file://` URL, and a hand-written relative path. **A local source flattens
+`<bucket>/<uck>` to `<bucket>`**, turning `../creds/index.js` into `./index.js`.
+So the two specifiers disagree whenever a bucket is a copy rather than a clone,
+Node loads a second module instance with a second class identity, and
+`instanceof` returns false for a genuine `CredsError`.
+
+- **Depend on `err.kind` (a string). Not `instanceof`, not `err.name`, not
+  message text.**
+- Importing from a sibling bucket is an N4 violation anyway — which is the fix,
+  not a workaround.
+- The one sanctioned `instanceof CredsError` is **inside the `creds` uck**, on
+  its own class in its own module (`toCredsError`), where the specifier cannot
+  disagree with itself.
 
 ## 8. Conventions (non-normative, but stated)
 
@@ -332,7 +527,7 @@ discovery surface.
 | G1 | ⌛ done in 0.3.0 | `ctx.fVersion` is the negotiation point; add uck `minF`, warn on mismatch | core | S | yes |
 | G2 | ⌛ done in 0.3.0 | Enforce `desc` one-line + length cap in loader; add `about` for multi-line usage | core | S | yes |
 | G3 | ⌛ done in 0.3.0 | Exit semantics: rule "failure = throw or non-zero `process.exitCode`"; loader rejects non-`undefined` returns (or maps to exitCode); document the `process.exit(0)`-on-failure ban | core | S | yes |
-| G4 | ⌛ done in 0.3.0 (ctx.uck + unified shape; registry alias removal is the 1.0 break) | One `ctx` shape at register + run; add `ctx.uck(name)`; keep `registry` through 0.x, drop at 1.0 | core + all ucks | M | yes (1.0) |
+| G4 | ◐ run ctx shipped; 1.0 = add `ucks`/`registry` at register time, **delete `ctx.uck`** | One `ctx` shape everywhere. **Decision reversed:** `registry` is the sole accessor; `uck()` is deleted outright, no deprecation cycle (5 of 6 in-tree sites already used `registry`). See N20/N20a | core + `gh` | S | yes (1.0) |
 | G5 | ⌛ done — CredsError + credsApi.version=1 in creds; peers classify structurally (msg fallback kept) | Typed `CredsError` + `credsApi.version` + `providerVersion`; replace the `/locked/i` regex sites in ssh/gh/ha/fj; document the creds socket protocol in this doc | creds + 4 ucks | M | yes |
 | G6 | ⌛ done in 0.3.0 (registry always shipped) | Published f must ship `registry` in run ctx; until then peers degrade gracefully (stated rule, §4) | core | S | yes |
 | G7 | ⌛ done — package.json standardized, `f uck new` scaffolds, uckmain copied per bucket, doc path fixed | Standardize `package.json` (`{"name","type":"module"}`); scaffold via `f uck new`; kill cross-bucket imports (ship `uckmain` per bucket or as npm pkg) | tooling + buckets | S | no |
@@ -341,8 +536,11 @@ discovery surface.
 | G10 | ⌛ done in 0.3.0 | One uck per directory (loader error on multi-register), or fix `self` semantics (dir path + `selfName`) | core + tooling | S | no |
 
 **Implemented cut (Oct 2026):** core 0.3.0 ships G1/G2/G3/G6/G8/G9/G10;
-creds ships G5 (CredsError, `credsApi.version: 1`); the uck buckets ship G7. **Remaining for 1.0:**
-removal of the `registry` alias (G4) once no peer uses it directly.
+creds ships G5 (CredsError, `credsApi.version: 1`); the uck buckets ship G7.
+**Remaining for 1.0** (G4, reversed decision): add `ucks`/`registry` to the
+register-time ctx and **delete `ctx.uck`** — no deprecation cycle, since
+pre-1.0 breaking changes need no migration handling. `registry` itself never
+goes away. Un-numbered harness/doc work: `ROADMAP-1.0.md`.
 
 **Original suggested cut:** G1+G2+G3+G6+G9 as one core **minor** (0.3, additive);
 G5 as creds **minor** (back-compat: old message matching still works until

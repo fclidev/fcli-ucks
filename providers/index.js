@@ -96,7 +96,6 @@ export async function collect({ verbose } = {}) {
       name: p.name,
       uck: u.name,
       entry: u.entry,
-      hasExternalApi: true,
       // Advertised by the provider's credentialProvider; gates `creds set` dual-write.
       // Must be copied here — dropping it makes every provider look read-only to `set`.
       canWrite: p.canWrite === true,

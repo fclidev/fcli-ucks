@@ -19,7 +19,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { execSync } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -253,12 +253,171 @@ How to fix (pick one), all in the work clone:
   for (const n of ucks) process.stderr.write(`f uck: pushed ${n} → ${target.name}\n`);
 }
 
+/**
+ * `f uck check [name...]` — enforce CONTRACT.md §1/§2 on installed ucks, from
+ * the uck uck, so the check needs no core release. Exit 1 if any uck is
+ * invalid. `name`s restrict to those uck dirs; default is every uck in every
+ * git-clone bucket (`--all` adds the rest).
+ *
+ * Checks (CONTRACT ref): register returns exactly one (N8, G10), `name` matches
+ * the dir name (N6), `desc` present/one-line/≤ 120 (N10), `package.json`
+ * `type: module` (N2), `skills[].path` absolute + existing (S2), `run` is a
+ * function (N13). An import failure is a *finding*, not a crash — a uck that
+ * cannot import is exactly what this has to name.
+ */
+const DESC_MAX = 120;
+
+function allUckDirs() {
+  const out = [];
+  const store = path.join(F, "ucks");
+  let buckets;
+  try {
+    buckets = fs.readdirSync(store).sort();
+  } catch {
+    return out;
+  }
+  for (const b of buckets) {
+    const bd = path.join(store, b);
+    let names;
+    try {
+      names = fs.readdirSync(bd).sort();
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (n.startsWith(".") || n === "node_modules") continue;
+      const full = path.join(bd, n);
+      try {
+        if (fs.statSync(full).isDirectory() && fs.existsSync(path.join(full, "index.js"))) {
+          out.push({ bucket: b, dirName: n, dir: full });
+        }
+      } catch {}
+    }
+  }
+  return out;
+}
+
+async function checkOne(entry) {
+  const problems = [];
+  const indexPath = path.join(entry.dir, "index.js");
+
+  // N2 — package.json present with type: module
+  let pkg = null;
+  try {
+    pkg = JSON.parse(fs.readFileSync(path.join(entry.dir, "package.json"), "utf8"));
+  } catch (e) {
+    problems.push(e && e.code === "ENOENT" ? "N2 no package.json" : "N2 package.json unparseable");
+  }
+  if (pkg && pkg.type !== "module") problems.push(`N2 package.json type=${JSON.stringify(pkg.type)} (want "module")`);
+
+  // Not a contract violation: a uck that declares deps but has no
+  // node_modules is merely un-installed (`f up` installs them). Importing it
+  // here would report "Cannot find module <dep>" as if the uck were broken,
+  // so skip it and say why. Only when there is no node_modules at all AND
+  // dependencies are declared.
+  const declaresDeps = pkg && pkg.dependencies && Object.keys(pkg.dependencies).length > 0;
+  if (declaresDeps && !fs.existsSync(path.join(entry.dir, "node_modules"))) {
+    return { ...entry, problems, skips: ["deps not installed (npm i in the uck dir, or f up)"], ucks: [] };
+  }
+
+  // N3/N7 — importing must be side-effect free and register must not throw
+  let registered = null;
+  try {
+    const mod = await import(pathToFileURL(indexPath).href);
+    const m = mod.default ?? mod;
+    if (typeof m.register !== "function") {
+      problems.push("N7 index.js must export register(ctx)");
+      return { ...entry, problems, skips: [], ucks: [] };
+    }
+    registered = m.register({ fVersion: "0.0.0-check", self: entry.dirName });
+    if (!Array.isArray(registered)) registered = [registered];
+  } catch (e) {
+    problems.push(`N3 import failed: ${String(e?.message ?? e).split("\n")[0]}`);
+    return { ...entry, problems, skips: [], ucks: [] };
+  }
+
+  // G10 — one uck per directory
+  if (registered.length > 1) {
+    problems.push(`G10 registers ${registered.length} ucks from one dir (one per dir)`);
+  }
+
+  for (const u of registered) {
+    if (!u || typeof u !== "object") { problems.push("N8 register() returned a non-object"); continue; }
+    const label = u.name ?? "<no name>";
+    if (typeof u.name !== "string" || !u.name) problems.push("N9 missing name");
+    if (typeof u.run !== "function") problems.push(`N13 ${label}: run is ${typeof u.run}`);
+    if (typeof u.desc !== "string" || !u.desc) problems.push(`N10 ${label}: missing desc`);
+    else {
+      if (u.desc.includes("\n")) problems.push(`N10 ${label}: desc has a newline`);
+      if (u.desc.length > DESC_MAX) problems.push(`N10 ${label}: desc ${u.desc.length} > ${DESC_MAX} chars`);
+    }
+    if (u.name && u.name !== entry.dirName) problems.push(`N6 ${label}: dir is '${entry.dirName}'`);
+    for (const s of u.skills ?? []) {
+      const p = typeof s === "string" ? null : s.path;
+      if (!p) problems.push(`S2 ${label}: skill '${typeof s === "string" ? s : s.name}' has no path`);
+      else if (!path.isAbsolute(p)) problems.push(`S2 ${label}: skill path not absolute: ${p}`);
+      else if (!fs.existsSync(p)) problems.push(`S2 ${label}: skill file missing: ${p}`);
+    }
+    if (u.credentialProvider && "hasExternalApi" in u.credentialProvider) {
+      problems.push(`P8 ${label}: credentialProvider.hasExternalApi is removed (presence = discovery)`);
+    }
+  }
+  return { ...entry, problems, skips: [], ucks: registered.map((u) => u && u.name).filter(Boolean) };
+}
+
+async function cmdCheck(rest) {
+  let all = false;
+  const wanted = [];
+  for (const a of rest) {
+    if (a === "--all" || a === "-a") all = true;
+    else if (a.startsWith("-")) usage(`check: unknown flag ${a}`);
+    else wanted.push(a);
+  }
+  let entries = allUckDirs();
+  if (wanted.length) {
+    entries = entries.filter((e) => wanted.includes(e.dirName));
+    for (const w of wanted) if (!entries.some((e) => e.dirName === w)) usage(`check: no such uck dir: ${w}`);
+  } else if (!all) {
+    // Only your own work by default: buckets that are git clones.
+    entries = entries.filter((e) => fs.existsSync(path.join(F, "ucks", e.bucket, ".git")));
+  }
+
+  let bad = 0;
+  let skipped = 0;
+  for (const e of entries) {
+    const r = await checkOne(e);
+    if (r.problems.length) {
+      bad++;
+      process.stdout.write(`BAD ${e.bucket}/${e.dirName}\n`);
+      for (const p of r.problems) process.stdout.write(`    ${p}\n`);
+    } else if (r.skips && r.skips.length) {
+      skipped++;
+      process.stdout.write(`SKIP ${e.bucket}/${e.dirName}  ${r.skips.join("; ")}\n`);
+    } else {
+      process.stdout.write(`ok  ${e.bucket}/${e.dirName}  ${r.ucks.join(",")}\n`);
+    }
+  }
+  if (!entries.length) {
+    process.stderr.write("f uck: check found no uck dirs (use --all to include non-git buckets)\n");
+    return 1;
+  }
+  const checked = entries.length - skipped;
+  process.stderr.write(
+    `f uck: ${checked - bad}/${checked} valid` +
+      (skipped ? `, ${skipped} skipped` : "") +
+      (bad ? ` — ${bad} invalid` : "") +
+      `\n`
+  );
+  return bad ? 1 : 0;
+}
+
 function usage(msg) {
   const line = msg ? `f uck: ${msg}\n` : "";
   process.stderr.write(
     line +
       "usage: f uck <cmd>\n" +
       "  new <name> [--bucket <b>] [--desc <d>]   scaffold a new uck dir\n" +
+      "  check [uck...] [--all]                 validate uck dirs against CONTRACT.md\n" +
       "  repo add <name> <url> [--ref <ref>]   register a push target\n" +
       "  repo ls                               list push targets\n" +
       "  repo rm <name>                        unregister a target\n" +
@@ -323,7 +482,7 @@ export function register(ctx) {
     desc: "push store ucks to a git repo (bucket name = target name)",
     skills: [{ name: "f-uck-creation", path: path.join(__dirname, "SKILL.md") }],
     uckApi: { loadTargets, saveTargets, push, bucketUcks },
-    run: (argv, args) => {
+    run: async (argv, args) => {
       const a = [...(args._ ?? [])];
       let rName = null;
       let ref = null;
@@ -342,6 +501,9 @@ export function register(ctx) {
         case "new": {
           cmdNew(rest);
           break;
+        }
+        case "check": {
+          return await cmdCheck(rest);
         }
         case "repo": {
           const sub = rest[0];
