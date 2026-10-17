@@ -108,64 +108,65 @@ and the error path would then disagree about which store is authoritative).
 ## C. Harness, before release
 
 > **Decision needed, not a bug.** 0.3.1 shipped C1(a) (a local source inside the
-> store is refused) and deliberately did **not** touch C1(b). The reason is that
-> (b) is not a defect — it is a contradiction between two published positions:
-> `update.ts`'s comment says a clone is "never an editing surface", while the
-> published `f-uck-creation` skill tells authors "the store bucket is a live git
-> working tree… edit the bucket directly". Both cannot be true.
+> store is refused) and deliberately did **not** change C1(b). It is not a defect —
+> it is a contradiction between two published positions: `update.ts` says a clone is
+> "never an editing surface", while the published `f-uck-creation` skill tells
+> authors "the store bucket is a live git working tree… edit the bucket directly".
+> Both cannot be true, and the current mix is the worst of both: the docs encourage
+> the thing the tool is entitled to discard.
 >
-> The sketch here (`.f-dirty` marker, `git stash create` before reset, a
-> `--discard` flag) resolves it toward "authors edit buckets" — which means core
-> grows state and a recovery affordance to protect a workflow the model says not
-> to use. The opposite fix is smaller: keep `reset --hard`, and change the skill
-> so authoring happens in a clone with the bucket as a cache. Existing dirty
-> *protection* is already adequate (dirty buckets are skipped; non-TTY stdin
-> counts as "no"; `--force` aborts rather than discarding).
+> **Recommendation (0.3.1): keep `reset --hard`, fix the docs.** Not the `.f-dirty`
+> marker sketch, for two reasons:
 >
-> **Pick one before 1.0.**>
-> **Recommendation (0.3.1): keep `reset --hard`, and fix the skill.** Not the
-> `.f-dirty` marker sketch. Three reasons, one of them measured:
+> 1. **The marker is redundant for the case it was sketched for.** `f up` already
+>    skips a bucket whose tree is dirty *or* whose history is ahead of upstream,
+>    names it, and `--force` asks before discarding. Verified with a throwaway
+>    bucket clone holding one unpushed commit: core printed
+>    `has local changes (1 unpushed commit(s)) — skipped` and the commit survived.
+> 2. **A `.f-dirty` marker is not a commit graph.** It cannot tell an author's edit
+>    from a generated file or a stray `node_modules`, and "commit first, then wipe"
+>    writes to the author's repo as a side effect of a command whose documented job
+>    is to *update*. Core would grow permanent state plus a recovery UI to serve a
+>    workflow it also advises against — against "keep core f simple".
 >
-> 1. **The marker does not cover the loss that actually matters.** A dirty tree is
->    already protected — `upBucket()` *skips* a bucket with a dirty or non-default
->    branch, and `--force` refuses rather than discarding. What is not protected is
->    a **committed but unpushed** edit: the tree is clean, so it is not skipped, and
->    `reset --hard origin/main` deletes the only copy of that commit. Measured on a
->    throwaway clone: local `6993913` → after reset `8121d94`, the commit unreachable.
->    A dirty-worktree marker is blind to it by construction, because there is
->    nothing dirty.
-> 2. **The author already pushes.** The published skill's own workflow is
->    `f uck push`, and that is what was used for every uck change in this repo. Once
->    the edit is pushed, `reset --hard` is a no-op. The failure needs the author to
->    stop at exactly the step the skill says to do next — and step 4 of the same
->    skill already warns "unpushed edits in the store are wiped on the next update".
->    So the docs are not wrong, only buried: the model reads them while authoring,
->    and f's output while running.
-> 3. **A `.f-dirty` marker is not a commit graph.** It cannot tell a stash-worthy
->    edit from a generated file or a stray `node_modules`, and the "commit first,
->    then wipe" recovery it enables writes to the author's repo as a side effect of
->    a command whose documented job is to *update*. Core would grow permanent state
->    and a recovery UI to serve a workflow it also advises against — against
->    "keep core f simple".
+> **Shipped in this change:**
+> - `f uck check` warns per bucket about work `f up` would reset: commits ahead of
+>   upstream, commits on no remote at all, and uncommitted files (`node_modules`
+>   excluded, matching core's own check so it never cries wolf about deps). Warning
+>   only — exit status stays driven by uck validity, since `check` answers "are
+>   these files well-formed" and an author mid-rebase is not writing invalid ucks.
+>   It fired on my own uncommitted edit the first time I ran it.
+> - Skill: that warning is now the first thing under "Where it lives", and
+>   checklist step 1 is `f uck check` rather than `f uck repo ls`.
+> - `skills/default.md`: the ctx shape was still pre-A1 — no `contractVersion`,
+>   `registry` not named as the sole accessor, `self` not called out as a name and
+>   not a path. That one could cost an author hours. It also now says a source may
+>   not point into the store.
 >
-> **Cheaper than the marker, and worth doing regardless** (none of it changes the
-> contract):
-> - `f up` should say why it skipped a bucket, and name the unpushed case
->   explicitly: *"2 commits not on origin — `f uck push` first"*. Today a skip is
->   silent unless verbose, so the author learns from the damage.
-> - `f uck check` should warn when a bucket has commits ahead of its upstream.
->   That catches the loss *before* the next `f up`, in the tool the author already
->   runs while editing.
-> - One sentence at the top of the skill's "Where it lives": *the bucket is a
->   working tree, but `f up` resets it to origin — commit is not enough, push*.
+> No core change. `f up`'s existing behaviour is correct; the gap was only that an
+> author learns about at-risk work while running `f up`, so `f uck check` — the
+> command authors run *while editing* — now says it earlier.
 >
 > **If the owner instead decides buckets are authoritative editing surfaces**, then
-> `reset --hard` has to go entirely (fetch + fast-forward only, refuse to diverge)
-> — that is coherent too, but it is a bigger change than the marker, and it makes
-> `f up` unable to recover a bucket the author has rebased. Say which; do not leave
-> the two documents contradicting each other.
- The current state is the worst of both: the docs
-> encourage the thing the tool will discard.
+> `reset --hard` has to go entirely (fetch + fast-forward only, refuse to diverge).
+> That is coherent too, but it is bigger than the marker and leaves `f up` unable
+> to recover a bucket the author has rebased. Say which; do not keep both documents.
+>
+> **Two claims from earlier drafts of this section were wrong.** Recorded as wrong
+> rather than quietly deleted, because the failure mode is the same one behind the
+> C5 "64 KB" figure — a plausible mechanism reasoned about, not measured:
+>
+> - *"a `.f-dirty` marker cannot see a committed-but-unpushed edit and `f up`
+>   destroys it."* It does not. The "measurement" cloned a bucket, committed in the
+>   clone, reset, then read `HEAD` **in that same clone** — which shows the reset by
+>   construction and says nothing about whether the commit survives `f up`. The
+>   correct repro (throwaway clone, one commit ahead, through `f up`, piped stdin)
+>   shows core skipping the bucket and the commit surviving. `dirtyBuckets()` counts
+>   `@{u}..HEAD` precisely because the author already thought of this.
+> - *"a skip is silent unless verbose."* It is not — the skip is named on stderr
+>   with a count and the `--force` escape, unprompted. Coding against that claim
+>   would have duplicated logic that already works.
+
 ### C1 — `f up` can destroy a bucket, and a local source can corrupt one
 
 **Reproduced 2026-10-16** on this machine. Two distinct defects.

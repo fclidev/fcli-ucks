@@ -408,7 +408,65 @@ async function cmdCheck(rest) {
       (bad ? ` — ${bad} invalid` : "") +
       `\n`
   );
+
+  // Separately from per-uck validity: is anything about to be destroyed?
+  //
+  // `f up` runs `git reset --hard <origin>` on every clone, so a bucket with work
+  // that is not on the remote loses it. `f up` does refuse to do that silently —
+  // it skips a bucket whose working tree is dirty, or whose history is ahead of
+  // upstream, and --force still asks first. But you find that out *while running
+  // f up*, after the thing you were doing has already gone wrong. check is the
+  // command an author runs while editing, so say it here.
+  //
+  // This is a warning, not an error: `check` answers "are these uck files well
+  // formed", and an author mid-rebase is not writing invalid ucks. Exit code
+  // stays driven by `bad` alone.
+  const atRisk = bucketsAtRisk(entries);
+  for (const b of atRisk) process.stderr.write(`f uck: WARNING ${b}\n`);
+
   return bad ? 1 : 0;
+}
+
+/**
+ * Git buckets in `entries` holding work that `f up` would discard, phrased as the
+ * fix rather than the state. Deduplicated by bucket.
+ */
+function bucketsAtRisk(entries) {
+  const seen = new Set();
+  const out = [];
+  for (const e of entries) {
+    if (seen.has(e.bucket)) continue;
+    seen.add(e.bucket);
+    const dir = path.join(F, "ucks", e.bucket);
+    if (!fs.existsSync(path.join(dir, ".git"))) continue; // not a clone: nothing resets it
+    const up = gitTry("rev-parse --abbrev-ref @{upstream}", dir);
+    if (!up.ok) {
+      // No upstream configured. `f up` resets to origin/<default>, so a clone
+      // with local commits and no upstream is the least visible case of all.
+      const ahead = gitTry("rev-list --count HEAD --not --remotes", dir);
+      const n = parseInt(ahead.stdout, 10);
+      if (ahead.ok && Number.isFinite(n) && n > 0)
+        out.push(
+          `${e.bucket}: ${n} commit(s) on no remote — 'f up' resets this bucket to origin and they are gone. Publish with: f uck push`
+        );
+      continue;
+    }
+    const ahead = gitTry("rev-list --count @{upstream}..HEAD", dir);
+    const nAhead = ahead.ok ? parseInt(ahead.stdout, 10) : 0;
+    // node_modules is untracked by design and `f up` keeps it; excluding it here
+    // matches core's own dirty check, so this never cries wolf about deps.
+    const dirty = gitTry("status --porcelain --untracked-files=all -- . ':!node_modules'", dir);
+    const nDirty = dirty.stdout ? dirty.stdout.trim().split("\n").length : 0;
+    const parts = [
+      nAhead > 0 ? `${nAhead} commit(s) not on ${up.stdout}` : null,
+      nDirty > 0 ? `${nDirty} uncommitted file(s)` : null,
+    ].filter(Boolean);
+    if (parts.length)
+      out.push(
+        `${e.bucket}: ${parts.join(", ")} — 'f up' resets this bucket to origin. Publish with: f uck push`
+      );
+  }
+  return out;
 }
 
 function usage(msg) {

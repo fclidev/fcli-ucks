@@ -56,7 +56,7 @@ export function register(ctx) {
     desc: "terse description",     // shown in f help
     run: (argv, args, ctx) => {
       // args._ is the remaining CLI args (already stripped of the uck name)
-      // ctx = { fVersion, self, ucks: [{name,desc}], registry }
+      // ctx = { fVersion, contractVersion, self, ucks, registry }
       console.log("hello", args._.join(" "));
     },
     // argv?: (argv) => args        // optional custom arg parser
@@ -66,14 +66,20 @@ export function register(ctx) {
 export default { register };
 ```
 
-Two phases:
-- `register(ctx)` runs **once at load**, `ctx = { fVersion, self }` — no other
-  ucks are available yet (they haven't loaded).
-- `run(argv, args, ctx)` runs **per invocation**, after every uck is loaded,
-  `ctx = { fVersion, self, ucks: [{name,desc}], registry }`.
+Two phases (one ctx **shape**, not two — CONTRACT.md G4):
+- `register(ctx)` runs **once at load**. `ucks` / `registry` are a **partial
+  view**: only the ucks imported so far, which is load-order-dependent — use
+  them for *detection* (`"creds" in ctx.registry`), never as an authoritative
+  peer list.
+- `run(argv, args, ctx)` runs **per invocation**, after every uck is loaded, so
+  `ucks` / `registry` are complete here.
+- `ctx = { fVersion, contractVersion, self, ucks, registry }` at both times.
+  `contractVersion` is the contract this core implements; `self` is this uck's
+  **registered name**, *not* a path — derive a path from `import.meta.url`.
 
-**`ctx.registry`** (run time) is the full map of every uck's exported object —
-name -> what that uck returned from `register()`. A uck can export anything,
+**`ctx.registry`** is the **sole** sanctioned peer accessor — `name -> what that
+uck returned from register()`. There is no `ctx.uck()` and no `ctx.deps`; if a
+uck or doc mentions one, it predates contract v1. A uck can export anything,
 and any other uck can read it off `ctx.registry` at run time. That's how ucks
 interoperate: e.g. a uck that exports `skills: [...]` contributes skills that
 the `skills` uck merges in. Core imposes no restrictions on what a uck
@@ -87,7 +93,12 @@ in its own `package.json` (f runs `npm i` in the uck dir on install / `f up`)
 
 To try a uck locally without a repo: `f config add ucks ./myuck` (or add it to
 `f.config.json`), then `f up` — it installs to `~/.f/ucks/<bucket>/myuck/` and
-becomes `f myuck`.
+becomes `f myuck`. The bucket dir is named after the **source**, not the uck, so
+one source dir can hold many ucks.
+
+Do not point a source at a directory inside `~/.f/ucks` — installing it copies a
+tree over itself. Author in a clone you made (or in the bucket directly, then
+`f uck push`); `f config add` refuses sources inside the store.
 
 ## Personal uck repos
 

@@ -13,6 +13,12 @@ A command is needed a second time in a session (or is clearly repeated in script
 
 ## Where it lives (this machine)
 
+> **The bucket is a live git working tree, and `f up` resets it to origin.**
+> Committing is not enough — **push**. An unpushed commit is the one thing that
+> gets destroyed here: a dirty working tree makes `f up` *skip* the bucket, but a
+> clean tree with commits not on the remote looks up-to-date and gets reset.
+> `f uck check` warns about this while you work; run it before `f up`.
+
 - **The store bucket is the working repo.** A git bucket is the clone of its repo:
   `~/.f/ucks/<bucket>/` is a live git working tree that `f` reads ucks straight
   out of at run time. There is no separate checkout — edit the bucket directly.
@@ -62,7 +68,8 @@ export default { register };
 
 ## Publishing checklist
 
-1. `f uck repo ls` — confirm the bucket is a clone with the right origin.
+1. `f uck check` — validates the ucks **and** warns if a bucket holds work that
+   `f up` would reset away. (`f uck repo ls` also shows push targets/origins.)
 2. Add `myuck/index.js` in the bucket (`~/.f/ucks/kensand-fcli-ucks/myuck/`) or the repo checkout.
 3. Publish. Note: for NEW (untracked) uck dirs, `f uck push` only commits dirty TRACKED files, so it can say "nothing to do" — in that case commit directly in the bucket:
    ```
