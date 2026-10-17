@@ -1,0 +1,33 @@
+{
+  "name": "@fcli.dev/ucks",
+  "version": "0.1.0",
+  "description": "Default ucks for f (fcli) — the bundle that f installs into the store",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node scripts/assemble.mjs",
+    "test": "node --test v/test/ w/test/ ls/test/ 2>/dev/null; node --test creds/test/ config/config.test.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "keywords": [
+    "fcli",
+    "uck",
+    "cli"
+  ],
+  "author": "fcli.dev",
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fclidev/fcli-ucks.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fclidev/fcli-ucks/issues"
+  }
+}

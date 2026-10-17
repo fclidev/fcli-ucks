@@ -1,0 +1,112 @@
+name: publish
+
+# Publishes @fcli.dev/ucks to npm when a v* tag is pushed, using npm TRUSTED
+# PUBLISHING (OIDC). No NPM_TOKEN secret is needed or stored.
+#
+# One-time npm-side setup (do this before the first tag):
+#   1. https://www.npmjs.com  ->  Access Tokens -> Trusted Publishers
+#   2. "Add trusted publisher":
+#        Provider:       GitHub
+#        GitHub owner:   fclidev
+#        Repository:     fcli-ucks
+#        Environment:    npm
+#   3. Approve. Only this workflow (from that repo + environment) may now
+#      publish `@fcli.dev/ucks`.
+#
+# The "Environment" value above MUST equal the `environment:` in this file.
+#
+# https://docs.npmjs.com/trusted-publishers
+# https://github.blog/changelog/2025-07-31/npm-trusted-publishing-with-oidc-is-generally-available/
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# id-token: write lets GitHub Actions mint the OIDC token that npm verifies.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Must match the "Environment" chosen when adding the trusted publisher on
+    # npm. Also gives you an optional approval gate (Environments -> npm).
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Node 22.14+ / npm 11.5.1+ are REQUIRED for npm OIDC trusted
+          # publishing. Node 20 ships npm 10, which cannot do OIDC publish and
+          # fails with a misleading E404. Node 24 is current LTS and bundles
+          # npm 11.x.
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Fail fast if the tag doesn't match package.json, so we never publish a
+      # version that disagrees with what's in the repo.
+      - name: Verify tag matches package version
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          tag=${GITHUB_REF_NAME#v}
+          echo "package.json version: $pkg"
+          echo "tag version:          $tag"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg"
+            exit 1
+          fi
+
+      # Assemble dist/ (uck dirs + shared lib + manifest + deps).
+      - name: Assemble bundle
+        run: node scripts/assemble.mjs
+
+      # Install the runtime deps of all ucks into dist/node_modules so the
+      # published tarball is self-contained.
+      - name: Install uck runtime deps
+        run: |
+          cd dist
+          # assemble.mjs emits deps.json with the union of all uck runtime deps.
+          # Install it as the root package's deps so node_modules lands here,
+          # then restore the clean root package.json (no deps of its own —
+          # the per-uck dep map lives in manifest.json for `f`).
+          root_p=$(node -p "require('../package.json')")
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('../package.json', 'utf8'));
+            pkg.dependencies = require('./deps.json');
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          npm install --omit=dev --no-audit --no-fund
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('../package.json', 'utf8'));
+            delete pkg.dependencies;
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Verify the bundle
+        run: |
+          node -e "
+            const m = require('./dist/manifest.json');
+            for (const [name, meta] of Object.entries(m.ucks)) {
+              require('node:fs').accessSync('dist/' + name + '/index.js');
+            }
+          "
+          ls dist/
+
+      # assemble.mjs also emits deps.json; keep dist clean before publishing.
+      - name: Clean dist
+        run: |
+          rm -f dist/deps.json dist/package-lock.json
+          # npm install in dist/ created a package.json there — remove it;
+          # the tarball must have exactly one package.json at the root.
+          rm -f dist/package.json
+
+      # No NODE_AUTH_TOKEN: npm uses the GHA OIDC token (from id-token: write)
+      # and authorizes it against the trusted publisher registered for this
+      # repo + the "npm" environment + @fcli.dev/ucks.
+      - name: Publish to npm (trusted publishing)
+        run: npm publish
