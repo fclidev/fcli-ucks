@@ -1,5 +1,10 @@
 # fcli-ucks
 
+[![npm version](https://img.shields.io/npm/v/@fcli.dev/ucks)](https://www.npmjs.com/package/@fcli.dev/ucks)
+[![unpacked size](https://img.shields.io/npm/unpacked-size/@fcli.dev/ucks)](https://www.npmjs.com/package/@fcli.dev/ucks)
+[![build](https://img.shields.io/github/actions/workflow/status/fclidev/fcli-ucks/publish.yml)](https://github.com/fclidev/fcli-ucks/actions/workflows/publish.yml)
+[![license](https://img.shields.io/github/license/fclidev/fcli-ucks)](LICENSE)
+
 Default ucks for [f](https://fcli.dev). This repo is a **bag of ucks** — every
 subdirectory is one uck, entered through its `index.js`.
 
