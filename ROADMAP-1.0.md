@@ -34,7 +34,7 @@ Line refs are to the **bundled** `dist/index.js` in the published tarball
 | **C2 store lock** | symlink lock around store mutation; dead-holder reclaim by pid+boot-id | measured: no lock ⇒ bucket with no `.git` |
 | **C5 exit handling** | `exitCode` instead of `exit(1)`; measured 7.4 MB of 52.5 MB lost in 0.3.0 | `test/stdout-drain.test.ts` |
 | **C5 stdout** | done; `f version` table + trust model still open | see C5 below |
-| C1, C4, C6, D, D2 | open | here |
+| C1(b), C4, C6, C7, D, D2 | open | here |
 | **install bugs found en route** | `#ref` made every ref'd source uninstallable; `firstLine` hid git's reason; local paths percent-encoded; `file://` misrouted to npm | all in 0.3.1 |
 
 ---
@@ -303,6 +303,28 @@ costs a build, and any test that needs a fake store pays the same tax.
   `f version` print f version, `contractVersion`, store path, node version,
   and a `bucket → url @ commit` table. That table is also what makes C1
   damage diagnosable.
+
+### C7 — the `config` uck is untested and `add` loses data — **new, found 0.3.1**
+
+`f config add ucks <value>` on a config with no `ucks` array writes `{}`, prints
+nothing and **exits 0** — the value is silently discarded. That includes the
+example the uck prints in its own usage:
+
+```console
+$ f config add ucks github:user/repo     # the documented example
+$ cat f.config.json
+{}
+```
+
+Cause: `applyAdd`'s fallback when the path selects nothing is
+`setPathCreate(doc, clean, undefined)` — it walks to `doc.ucks`, assigns
+`undefined` (so the key does not persist) and then re-reads an array that was
+never created. A command that silently does nothing is the worst possible
+failure mode for an LLM caller: no exit code, no stderr, nothing to react to.
+
+Fix: create the array and push (the current behaviour is data loss, so no
+migration concern). Add `test/config.test.js` — `config` is the only stateful
+uck with no test file, which is why this survived.
 
 ### C6 — provider probe protocol self-test — also blocks test isolation
 
