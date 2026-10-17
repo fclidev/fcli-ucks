@@ -36,6 +36,11 @@ function writeDoc(path, doc) {
 
 /** Parse a value: try JSON first, fall back to raw string. */
 function parseValue(raw) {
+  // NOTE: String(value) in the callers is only correct because every value that
+  // reaches it is already a string (an argv token). It is a trap for programmatic
+  // callers: configApi.add(t, "ucks", ["a"]) stringifies to "a" and stores the
+  // string, not the array. Parse non-strings through unchanged.
+  if (typeof raw !== "string") return raw;
   try {
     return JSON.parse(raw);
   } catch {
@@ -120,7 +125,7 @@ const configApi = {
   set(target, path, value) {
     const file = resolveTarget(target);
     const doc = readDoc(file);
-    const val = parseValue(String(value));
+    const val = parseValue(value);
     applySet(doc, path, val);
     assertSourcesUsable(doc);
     writeDoc(file, doc);
@@ -131,7 +136,7 @@ const configApi = {
   add(target, path, value) {
     const file = resolveTarget(target);
     const doc = readDoc(file);
-    const val = parseValue(String(value));
+    const val = parseValue(value);
     applyAdd(doc, path, val);
     assertSourcesUsable(doc);
     writeDoc(file, doc);
@@ -194,24 +199,88 @@ function setPathCreate(doc, path, value) {
 
 /** Append into an array. Path must select an array (e.g. "ucks" or "ucks[$]"). */
 function applyAdd(doc, path, value) {
-  // Strip trailing [$] if present.
+  // Append `value` to the array selected by `path`, creating it when absent.
+  //
+  // Everything is driven by JSONPath's own resultType "all" records
+  // (parent / parentProperty) — the same source of truth applySet uses. Two
+  // hand-rolled shortcuts lost data here:
+  //   * the fallback was setPathCreate(doc, path, undefined): it assigned
+  //     undefined, the key did not survive JSON.stringify, and
+  //     `f config add ucks github:user/repo` — the example in this uck's own
+  //     usage line — wrote {} and exited 0;
+  //   * parseSegments("ucks[0]") returns ["ucks","0"], where "0" is part of the
+  //     selector and not a container to walk into; walking it produced
+  //     {"ucks":{"0":["b"]}}.
+  //
+  // An absent path must still work rather than fail: `add` is how a fresh config
+  // gets its first source, and it is f's own bootstrap path — ensureGlobalConfig()
+  // seeds a source with no ref, so `f config add <x>#main` on a machine that has
+  // never run f also lands here.
   const clean = path.replace(/\[\$\]$/, "");
-  const res = JSONPath({ path: clean, json: doc, wrap: true });
-  if (Array.isArray(res) && res.length > 0) {
-    for (const arr of res) {
-      if (Array.isArray(arr)) arr.push(value);
+  const segments = parseSegments(clean);
+  if (segments.length === 0) throw new Error(`config: '${path}' is not a usable path`);
+  const leaf = segments.at(-1);
+  const matches = JSONPath({ path: clean, json: doc, resultType: "all" });
+  const anchor = matches[0];
+  const parent = anchor && "parent" in anchor ? anchor.parent : undefined;
+  const prop = anchor && "parentProperty" in anchor ? anchor.parentProperty : undefined;
+  const owner =
+    clean.replace(/\[[^\]]*\]$/, "") ||
+    segments.slice(0, -1).reduce((acc, seg) => (seg.match(/^\d+$/) ? acc : acc + "." + seg), "").replace(/^\./, "") ||
+    "the array";
+
+  // A positional path is refused whether or not it currently matches.
+  //   `add ucks[5] x` on a 1-element array matched nothing and would have written
+  //   a HOLE — a hole serialises as null, and core's source loop does
+  //   `typeof s === "string" ? s : s?.source`, so null becomes undefined and
+  //   every later f command dies with "Uck source not found: undefined".
+  //   `add ucks[0] x` on a 1-element array matched the element "a"; pushing onto
+  //   a string is a no-op, so it reported success having changed nothing.
+  // Positions have no append semantics at all — `set` is the operation for them.
+  if (/^\d+$/.test(leaf)) {
+    throw new Error(
+      `config: '${clean}' addresses a position — use 'f config set' to replace it, or 'f config add ${owner}' to append`
+    );
+  }
+
+  if (Array.isArray(parent)) {
+    // The selector addressed an element of an array ($, or a name that JSONPath
+    // resolved through one). Only [$] means "append here".
+    if (leaf === "$") {
+      parent.push(value);
+      return;
     }
+    throw new Error(`config: '${clean}' addresses a position — use 'f config add ${owner}' to append`);
+  }
+
+  if (parent !== undefined && prop !== undefined && prop !== null) {
+    if (parent[prop] === undefined) {
+      parent[prop] = [value];
+      return;
+    }
+    if (!Array.isArray(parent[prop]))
+      throw new Error(
+        `config: '${clean}' is ${typeof parent[prop]}, not an array — use 'f config set' to give it a value`
+      );
+    parent[prop].push(value);
     return;
   }
-  // Path points to a non-array or nothing — create array via create path.
-  setPathCreate(doc, clean, undefined);
-  const again = JSONPath({ path: clean, json: doc, wrap: true });
-  if (Array.isArray(again) && again.length > 0 && Array.isArray(again[0])) {
-    again[0].push(value);
+
+  // Nothing matches: the key is absent. Create it (dotted paths included) and
+  // store an array.
+  let cursor = doc;
+  for (const seg of segments.slice(0, -1)) {
+    if (cursor[seg] === undefined) cursor[seg] = {};
+    cursor = cursor[seg];
+    if (cursor === null || typeof cursor !== "object")
+      throw new Error(`config: '${clean}' passes through a non-object`);
   }
+  if (cursor[leaf] === undefined) cursor[leaf] = [];
+  if (!Array.isArray(cursor[leaf]))
+    throw new Error(`config: '${clean}' is not an array — use 'f config set' to give it a value`);
+  cursor[leaf].push(value);
 }
 
-/** Remove all matches. Returns count removed. */
 function applyRemove(doc, path) {
   // Collect parents+indices for array elements, or keys for object props.
   const all = JSONPath({ path, json: doc, resultType: "all" });
@@ -261,7 +330,13 @@ export function register(ctx) {
       const [op, path, value] = pos;
       if (!op) return usage();
 
-      switch (op) {
+      // A config edit that cannot be done must fail as one line plus the fix
+      // (CONTRACT.md R3), not as a Node stack trace: this uck is the thing an LLM
+      // reaches for when it is already confused about config, and a 30-frame
+      // stack gives it nothing to act on. Previously there was no catch at all,
+      // so a throwing add/set printed the stack of an internal helper.
+      try {
+        switch (op) {
         case "get":
           if (!path) return usage("get requires a path (or omit for whole doc)");
           print(configApi.get(target, path));
@@ -283,6 +358,10 @@ export function register(ctx) {
           break;
         default:
           usage();
+        }
+      } catch (e) {
+        process.stderr.write(`f: ${e instanceof Error ? e.message : String(e)}\n`);
+        process.exitCode = 1; // not exit(1): CONTRACT.md C5 — never truncate stdout
       }
     },
   };
@@ -303,7 +382,11 @@ function usage(msg) {
       "       f config set ucks[0] ./my-uck\n" +
       "       f config remove 'ucks[?(@.source==\"./old\")]'\n"
   );
-  process.exit(1);
+  // exitCode, not exit(): CONTRACT.md C5. process.exit() throws away whatever is
+  // still buffered on stdout when stdout is a pipe — which is exactly how an agent
+  // invokes a uck — so the truncation core just fixed would come back through a
+  // usage error, quietly.
+  process.exitCode = 1;
 }
 
 export default { register, configApi };
