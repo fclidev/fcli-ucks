@@ -34,7 +34,8 @@ Line refs are to the **bundled** `dist/index.js` in the published tarball
 | **C2 store lock** | symlink lock around store mutation; dead-holder reclaim by pid+boot-id | measured: no lock ⇒ bucket with no `.git` |
 | **C5 exit handling** | `exitCode` instead of `exit(1)`; measured 7.4 MB of 52.5 MB lost in 0.3.0 | `test/stdout-drain.test.ts` |
 | **C5 stdout** | done; `f version` table + trust model still open | see C5 below |
-| C1(b), C4, C6, C7, D, D2 | open | here |
+| C4, C6, C7, D, D2 | open | here |
+| C1(b), C7, C8 | closed 0.3.1 | done — C1(b) needed no core change; C8 is new, from building the fix |
 | **install bugs found en route** | `#ref` made every ref'd source uninstallable; `firstLine` hid git's reason; local paths percent-encoded; `file://` misrouted to npm | all in 0.3.1 |
 
 ---
@@ -453,3 +454,16 @@ Two fixes:
   already distinguishable from "printed `ready: false`". Revisit only if C6's
   probe self-test needs to *parse* readiness rather than merely probe it.
 - **Output formatting as contract.** Stays style, per §0.
+
+### C8 — `npm test` tests the previous build — **new, found 0.3.1**
+
+`"test": "vitest run"` with no `pretest` build. `dist/` is a committed build
+artifact and several tests spawn it (the C4 store-path blocker leaves no
+in-process seam), so **a test can pass while the fix it exists to protect is not
+in the binary**. Observed directly: the C1(b) dirty-check fix "did not work", the
+test stayed red, and only `npm run build` turned it green.
+
+Fix: `"pretest": "npm run build"` — or drop `dist/` from git and always build, so
+CI cannot test a stale artifact either. Cheap, and it removes a whole class of
+"but my test passed".
+
