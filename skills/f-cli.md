@@ -20,8 +20,11 @@ description: Use the `f` token-efficient CLI (ucks) instead of raw commands. Pre
 
 ## Orientation (cheap, run once)
 
-- `f help` — every available uck with a one-line desc.
-- `f <uck> --help` — the uck's own usage text.
+- `f` — every available uck **name**, no descriptions. Cheap; run it once.
+- `f search <query>` — rank ucks by name then description, when you know the
+  capability but not the command word. Matching is substring/prefix, so use
+  words you expect to appear (`f search credential`, not `f search auth-ish`).
+- `f <uck> --help` — the uck's own usage text, with full description.
 - `f v` — f version.
 
 ## Built-in ucks
@@ -43,4 +46,4 @@ description: Use the `f` token-efficient CLI (ucks) instead of raw commands. Pre
 
 ## The rule
 
-If you are about to run a command for the **second time** in a session (or you already see it repeated in a script/CI file), check `f help` for a covering uck first; if none exists, create one (skill `f-uck-creation`) instead of repeating the raw command.
+If you are about to run a command for the **second time** in a session (or you already see it repeated in a script/CI file), check `f search <query>` for a covering uck first; if none exists, create one (skill `f-uck-creation`) instead of repeating the raw command.
