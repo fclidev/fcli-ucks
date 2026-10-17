@@ -31,7 +31,11 @@ Line refs are to the **bundled** `dist/index.js` in the published tarball
 | **A1/A2 core** | `ctx.uck` deleted, `ctx.contractVersion` added, register/run one ctx shape | core `36bc090`, covered by `test/ctx-contract.test.ts` |
 | B5 `hasExternalApi` | removed — presence of `credentialProvider.name` **is** discovery | CONTRACT P8; flagged by `f uck check` |
 | C3 enforcement | **`f uck check` shipped** (no core release needed) | `uck/index.js` |
-| C1, C2, C4, C5, C6, D, D2 | open | here |
+| **C2 store lock** | symlink lock around store mutation; dead-holder reclaim by pid+boot-id | measured: no lock ⇒ bucket with no `.git` |
+| **C5 exit handling** | `exitCode` instead of `exit(1)`; measured 7.4 MB of 52.5 MB lost in 0.3.0 | `test/stdout-drain.test.ts` |
+| **C5 stdout** | done; `f version` table + trust model still open | see C5 below |
+| C1, C4, C6, D, D2 | open | here |
+| **install bugs found en route** | `#ref` made every ref'd source uninstallable; `firstLine` hid git's reason; local paths percent-encoded; `file://` misrouted to npm | all in 0.3.1 |
 
 ---
 
@@ -103,6 +107,23 @@ and the error path would then disagree about which store is authoritative).
 
 ## C. Harness, before release
 
+> **Decision needed, not a bug.** 0.3.1 shipped C1(a) (a local source inside the
+> store is refused) and deliberately did **not** touch C1(b). The reason is that
+> (b) is not a defect — it is a contradiction between two published positions:
+> `update.ts`'s comment says a clone is "never an editing surface", while the
+> published `f-uck-creation` skill tells authors "the store bucket is a live git
+> working tree… edit the bucket directly". Both cannot be true.
+>
+> The sketch here (`.f-dirty` marker, `git stash create` before reset, a
+> `--discard` flag) resolves it toward "authors edit buckets" — which means core
+> grows state and a recovery affordance to protect a workflow the model says not
+> to use. The opposite fix is smaller: keep `reset --hard`, and change the skill
+> so authoring happens in a clone with the bucket as a cache. Existing dirty
+> *protection* is already adequate (dirty buckets are skipped; non-TTY stdin
+> counts as "no"; `--force` aborts rather than discarding).
+>
+> **Pick one before 1.0.** The current state is the worst of both: the docs
+> encourage the thing the tool will discard.
 ### C1 — `f up` can destroy a bucket, and a local source can corrupt one
 
 **Reproduced 2026-10-16** on this machine. Two distinct defects.
@@ -165,6 +186,10 @@ Fixes:
   `f up`'s loop can skip them — so `up`'s view of "what's installed" and
   "what's updatable" disagree.
 
+**C2 and C5's exit/stdout half shipped in 0.3.1.** C1's local-source half (a)
+also shipped: a source resolving inside the store is refused. The author-bucket
+half of C1 is a *policy* choice, not a bug — see the note at the end of C1.
+
 ### C2 — no concurrency safety — **needs core, invisible to the contract**
 
 `grep -n "pid\|\.lock\|singleton" dist/index.js` → nothing. Two `f` processes
@@ -173,8 +198,29 @@ the live dir aside, so a concurrent load can register from a half-swapped
 tree, and `restoreStash`/`discardStashes` can fight over the same stash dirs.
 Compounded by C1(a), which leaves `.f-source.json` stale-but-present.
 
-One `~/.f/.ucks.lock` (O_EXCL + pid + stale detection) around install/reset
-and around the load phase fixes it. No contract surface.
+One lock around store mutation fixes it. No contract surface. **Shipped in
+0.3.1** (`src/lock.ts`), with three corrections to the sketch above:
+
+- **Lock a symlink, not an O_EXCL file.** `symlink()` fails EEXIST when the name
+  exists at all (file, dir, or dangling), and the pid rides in the link *target*
+  — so there is no zero-length-file race and no second metadata file to read.
+- **A timeout is not a staleness test.** The obvious "give up after N seconds"
+  design steals the lock from a healthy `f up` (which clones several buckets and
+  npm-installs each, so minutes is legitimate) and reintroduces exactly the
+  interleaving the lock exists to stop. A waiter waits and, after a few seconds,
+  prints which pid holds it. Staleness is decided by pid liveness (+ boot id, so
+  pid reuse is not mistaken for a dead holder), never by elapsed time.
+- **Dead-holder reclaim is mandatory.** Without it a single SIGKILL leaves a lock
+  that bricks every f command until someone deletes a file by hand. Note core's
+  own `index` uck says a `SIGKILL` is "the only way to stop" a daemon — so this
+  is not a hypothetical path.
+
+The load phase deliberately stayed **outside** the lock: a load takes no lock at
+all when there is nothing to install, and holding one across a whole command
+turns "two shells open f" into a serialization nobody asked for. Measured
+without the lock, two concurrent `f up` runs left a bucket directory with **no
+`.git`** and both runs failing; the test records that so the invariant survives
+whoever edits the lock next.
 
 ### C3 — contract enforcement — **`f uck check` shipped; `f doctor` still open**
 
@@ -230,12 +276,18 @@ costs a build, and any test that needs a fake store pays the same tax.
 
 ### C5 — dispatch and path hardening — **needs core**
 
-- **Unknown uck truncates stdout.** `console.error(...); process.exit(1)` for
-  an unknown uck (`:809`) and in the catch (`:836`) discards buffered stdout
-  writes — a uck that printed 64 KB of a report then throws loses the report,
-  which is also a secret-leak path (`process.exit` skips flush). Use
-  `process.exitCode` + return so stdout drains. (Note the inconsistency:
-  `lib/uckmain.js` *does* use `exitCode`; the harness does not.)
+- **Unknown uck truncates stdout — FIXED in 0.3.1.** `console.error(...);
+  process.exit(1)` for an unknown uck and in the catch discarded buffered stdout.
+  The claim was right; the *size* in the original note was wrong. Measured: on
+  Linux, pipes are synchronous since 2.6.35, so 64 KB / 640 KB / 3 MB all
+  survived `exit(1)` intact — three attempts at a regression test measured
+  nothing for that reason. It only shows at 52 MB: **0.3.0 delivered 7.4 MB of
+  52.5 MB**. So the correct statement is not "large reports get truncated at
+  ~64 KB" but "the truncation threshold is platform- and buffer-dependent, which
+  is exactly why it must not be the mechanism deciding how much of a printed
+  secret survives". Fixed with `process.exitCode` + return; the unknown-uck path
+  additionally had the cheaper bug of discarding everything printed earlier in
+  the same run.
 - **Bucket labels are not unique.** `sourceBucket()` (`:126`) derives the same
   label for a bare local uck and for a bucket, so `name` is not a stable
   provenance key. Namespace the registry key as `<bucket>/<name>` internally,
