@@ -453,9 +453,19 @@ function bucketsAtRisk(entries) {
     }
     const ahead = gitTry("rev-list --count @{upstream}..HEAD", dir);
     const nAhead = ahead.ok ? parseInt(ahead.stdout, 10) : 0;
-    // node_modules is untracked by design and `f up` keeps it; excluding it here
-    // matches core's own dirty check, so this never cries wolf about deps.
-    const dirty = gitTry("status --porcelain --untracked-files=all -- . ':!node_modules'", dir);
+    // node_modules is untracked by design and `f up` keeps it. package-lock.json
+    // is tracked and must be excluded too: f's own installDepsInTree() runs
+    // `npm install` inside each uck dir, which rewrites it. Measured on a freshly
+    // seeded store, the *only* dirty file was `config/package-lock.json` — so a
+    // warning on it blames an author for a change core itself made, on every
+    // machine, before they have typed anything. A warning that is always wrong is
+    // worse than no warning: it teaches the reader to ignore the warning that
+    // would save their work. (Core's own dirty check has the same blind spot;
+    // recorded in ROADMAP-1.0.md.)
+    const dirty = gitTry(
+      "status --porcelain --untracked-files=all -- . ':!node_modules' ':!*package-lock.json'",
+      dir
+    );
     const nDirty = dirty.stdout ? dirty.stdout.trim().split("\n").length : 0;
     const parts = [
       nAhead > 0 ? `${nAhead} commit(s) not on ${up.stdout}` : null,
