@@ -3,7 +3,15 @@
 // CI runs this after `npm ci`-ing each uck's deps, so node_modules exist
 // where they do in the repo; anything missing is installed on the fly.
 
-import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import {
+  cpSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -26,6 +34,11 @@ const shared = readdirSync(root, { withFileTypes: true })
   .map((d) => d.name)
   .filter((n) => n === "lib" && existsSync(path.join(root, n, "package.json")));
 
+// Rebuild from scratch. dist/ is gitignored and cpSync never deletes, so a
+// stale dir survives every later build and npm pack ships it: ls/ and w/ were
+// removed from the source tree and still went out in 0.2.0 because of this.
+// node_modules is included because it is assembled per-build from uck deps.
+if (existsSync(dist)) rmSync(dist, { recursive: true, force: true });
 mkdirSync(dist, { recursive: true });
 mkdirSync(path.join(dist, "node_modules"), { recursive: true });
 
