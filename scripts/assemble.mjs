@@ -60,12 +60,15 @@ for (const name of [...shared, ...ucks].sort()) {
     manifest.shared = manifest.shared ?? [];
     manifest.shared.push(name);
   } else if (existsSync(uckPkgPath)) {
+    // Record the uck either way. The condition here used to be
+    // `if (uckPkg.dependencies)`, so a uck with no dependencies was copied into dist/
+    // and left out of the manifest: @fcli.dev/ucks@0.2.0 shipped 8 ucks and declared 1.
+    // Nothing broke because `f` discovers ucks by walking for index.js and reads only
+    // .version from this file -- but the manifest misdescribed the artifact it sits in,
+    // and the first consumer that enumerates ucks from it would see one uck in a bundle
+    // of eight. Deps still come from the same object below.
     const uckPkg = JSON.parse(readFileSync(uckPkgPath, "utf8"));
-    if (uckPkg.dependencies) {
-      // Flatten each uck's runtime deps into the bundle's dep map so CI can
-      // npm ci them in one pass, and so `f` can reify them later.
-      manifest.ucks[name] = uckPkg;
-    }
+    manifest.ucks[name] = uckPkg;
   } else {
     manifest.ucks[name] = {};
   }
