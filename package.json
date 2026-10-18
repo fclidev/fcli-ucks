@@ -8,7 +8,7 @@
   ],
   "scripts": {
     "build": "node scripts/assemble.mjs",
-    "test": "node --test v/test/ w/test/ ls/test/ 2>/dev/null; node --test creds/test/ config/config.test.js"
+    "test": "node --test creds/test/ config/config.test.js"
   },
   "publishConfig": {
     "access": "public"

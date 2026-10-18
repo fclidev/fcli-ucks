@@ -18,25 +18,25 @@ Line refs are to the **bundled** `dist/index.js` in the published tarball
 
 ## Where each item landed
 
-| item | outcome | landed in |
-|---|---|---|
-| A1 `uck()` vs `registry` | **reversed:** `registry` is the sole accessor; `ctx.uck` deleted outright | CONTRACT N20/N20a + G4 row; here §A1 |
-| A2 `contractVersion` | open — needs core | here §A2 |
-| A3 error vocabulary | `CredsKind` union normative; five vocabularies retired; cross-uck `instanceof` = undefined behaviour | CONTRACT §7.2, §7.3, C2 |
-| A4 cloneable `ctx` | declared | CONTRACT N20b |
-| B1 bucket-level `lib/` | cross-bucket import forbidden three ways; two legal homes for shared code; probe-transport consequence stated | CONTRACT N4, §5 P7 |
-| B2 `self` = registered name | CONTRACT was already right; the wrong doc is **core README:217** ("source label") | here §D |
-| B3 `ctx.dir` | withdrawn; replaced by the `here` idiom as a rule | CONTRACT S2; here §Decided |
-| B4 `status --json` | declined; the probe protocol was made normative instead | CONTRACT §5 P4 |
-| **A1/A2 core** | `ctx.uck` deleted, `ctx.contractVersion` added, register/run one ctx shape | core `36bc090`, covered by `test/ctx-contract.test.ts` |
-| B5 `hasExternalApi` | removed — presence of `credentialProvider.name` **is** discovery | CONTRACT P8; flagged by `f uck check` |
-| C3 enforcement | **`f uck check` shipped** (no core release needed) | `uck/index.js` |
-| **C2 store lock** | symlink lock around store mutation; dead-holder reclaim by pid+boot-id | measured: no lock ⇒ bucket with no `.git` |
-| **C5 exit handling** | `exitCode` instead of `exit(1)`; measured 7.4 MB of 52.5 MB lost in 0.3.0 | `test/stdout-drain.test.ts` |
-| **C5 stdout** | done; `f version` table + trust model still open | see C5 below |
-| C4, C6, C7, D, D2 | open | here |
-| C1(b), C7, C8 | closed 0.3.1 | done — C1(b) needed no core change; C8 is new, from building the fix |
-| **install bugs found en route** | `#ref` made every ref'd source uninstallable; `firstLine` hid git's reason; local paths percent-encoded; `file://` misrouted to npm | all in 0.3.1 |
+| item                            | outcome                                                                                                                             | landed in                                                            |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| A1 `uck()` vs `registry`        | **reversed:** `registry` is the sole accessor; `ctx.uck` deleted outright                                                           | CONTRACT N20/N20a + G4 row; here §A1                                 |
+| A2 `contractVersion`            | open — needs core                                                                                                                   | here §A2                                                             |
+| A3 error vocabulary             | `CredsKind` union normative; five vocabularies retired; cross-uck `instanceof` = undefined behaviour                                | CONTRACT §7.2, §7.3, C2                                              |
+| A4 cloneable `ctx`              | declared                                                                                                                            | CONTRACT N20b                                                        |
+| B1 bucket-level `lib/`          | cross-bucket import forbidden three ways; two legal homes for shared code; probe-transport consequence stated                       | CONTRACT N4, §5 P7                                                   |
+| B2 `self` = registered name     | CONTRACT was already right; the wrong doc is **core README:217** ("source label")                                                   | here §D                                                              |
+| B3 `ctx.dir`                    | withdrawn; replaced by the `here` idiom as a rule                                                                                   | CONTRACT S2; here §Decided                                           |
+| B4 `status --json`              | declined; the probe protocol was made normative instead                                                                             | CONTRACT §5 P4                                                       |
+| **A1/A2 core**                  | `ctx.uck` deleted, `ctx.contractVersion` added, register/run one ctx shape                                                          | core `36bc090`, covered by `test/ctx-contract.test.ts`               |
+| B5 `hasExternalApi`             | removed — presence of `credentialProvider.name` **is** discovery                                                                    | CONTRACT P8; flagged by `f uck check`                                |
+| C3 enforcement                  | **`f uck check` shipped** (no core release needed)                                                                                  | `uck/index.js`                                                       |
+| **C2 store lock**               | symlink lock around store mutation; dead-holder reclaim by pid+boot-id                                                              | measured: no lock ⇒ bucket with no `.git`                            |
+| **C5 exit handling**            | `exitCode` instead of `exit(1)`; measured 7.4 MB of 52.5 MB lost in 0.3.0                                                           | `test/stdout-drain.test.ts`                                          |
+| **C5 stdout**                   | done; `f version` table + trust model still open                                                                                    | see C5 below                                                         |
+| C4, C6, C7, D, D2               | open                                                                                                                                | here                                                                 |
+| C1(b), C7, C8                   | closed 0.3.1                                                                                                                        | done — C1(b) needed no core change; C8 is new, from building the fix |
+| **install bugs found en route** | `#ref` made every ref'd source uninstallable; `firstLine` hid git's reason; local paths percent-encoded; `file://` misrouted to npm | all in 0.3.1                                                         |
 
 ---
 
@@ -47,11 +47,11 @@ Line refs are to the **bundled** `dist/index.js` in the published tarball
 Today there are three ad-hoc version dials and no way to answer "does this
 bucket speak this core's language":
 
-| dial | direction | where |
-|---|---|---|
-| `minF` | uck → f | checked in loader, warn only |
-| `credsApi.version: 1` | peer → peer | `creds/index.js` |
-| `providerVersion` | provider → creds | proposed, §5 P6 |
+| dial                  | direction        | where                        |
+| --------------------- | ---------------- | ---------------------------- |
+| `minF`                | uck → f          | checked in loader, warn only |
+| `credsApi.version: 1` | peer → peer      | `creds/index.js`             |
+| `providerVersion`     | provider → creds | proposed, §5 P6              |
 
 **Change:** `ctx.contractVersion: 1` at **register** time (so a uck can
 branch before it returns anything), plus `uckApiVersion?: number` on the uck
@@ -68,7 +68,7 @@ Declared in CONTRACT.md **N20b**: `ctx` and everything reachable from it must
 be structured-cloneable. No live handles (sockets, child processes, open fds,
 class instances with private fields) hung off `ctx`.
 
-**Why it isn't free to defer:** providers *already* cross a process boundary
+**Why it isn't free to defer:** providers _already_ cross a process boundary
 (`node <dir>/index.js resolve <name>`). The moment a provider author wants
 `ctx`-derived config on that path, an unclonable `ctx` forces a second,
 parallel config convention. Cheap to state now; expensive once a bucket
@@ -89,7 +89,7 @@ it also subsumes the subset, is the only form that can exist at register time,
 and the only one that can answer "what did I shadow?" (N9, §6.3). Recorded in
 CONTRACT.md N20/N20a.
 
-My objection was never "keep both" — it was that removing *`registry`* would be
+My objection was never "keep both" — it was that removing _`registry`_ would be
 a **silent** break, because `lib/credsresolve.js` takes `credsApi` as a
 parameter and so cannot reach `ctx.uck()` below `run()`. Reversing the direction
 dissolves it: deleting `ctx.uck` is loud (`f: ctx.uck is not a function`) and
@@ -101,7 +101,7 @@ run-time `ctx` is rebuilt per invocation, so no stale capture exists.
 accessor is `ctx.registry`; nothing is kept "for a release", because coexisting
 accessors are exactly what makes half-migration silent. `gh` is migrated
 (including its `catch` handler, which had the same `ctx.uck` fallback — leaving
-it would make the migration *worse* than not doing it, since the success path
+it would make the migration _worse_ than not doing it, since the success path
 and the error path would then disagree about which store is authoritative).
 
 ---
@@ -120,17 +120,18 @@ and the error path would then disagree about which store is authoritative).
 > marker sketch, for two reasons:
 >
 > 1. **The marker is redundant for the case it was sketched for.** `f up` already
->    skips a bucket whose tree is dirty *or* whose history is ahead of upstream,
+>    skips a bucket whose tree is dirty _or_ whose history is ahead of upstream,
 >    names it, and `--force` asks before discarding. Verified with a throwaway
 >    bucket clone holding one unpushed commit: core printed
 >    `has local changes (1 unpushed commit(s)) — skipped` and the commit survived.
 > 2. **A `.f-dirty` marker is not a commit graph.** It cannot tell an author's edit
 >    from a generated file or a stray `node_modules`, and "commit first, then wipe"
 >    writes to the author's repo as a side effect of a command whose documented job
->    is to *update*. Core would grow permanent state plus a recovery UI to serve a
+>    is to _update_. Core would grow permanent state plus a recovery UI to serve a
 >    workflow it also advises against — against "keep core f simple".
 >
 > **Shipped in this change:**
+>
 > - `f uck check` warns per bucket about work `f up` would reset: commits ahead of
 >   upstream, commits on no remote at all, and uncommitted files (`node_modules`
 >   excluded, matching core's own check so it never cries wolf about deps). Warning
@@ -146,7 +147,7 @@ and the error path would then disagree about which store is authoritative).
 >
 > No core change. `f up`'s existing behaviour is correct; the gap was only that an
 > author learns about at-risk work while running `f up`, so `f uck check` — the
-> command authors run *while editing* — now says it earlier.
+> command authors run _while editing_ — now says it earlier.
 >
 > **If the owner instead decides buckets are authoritative editing surfaces**, then
 > `reset --hard` has to go entirely (fetch + fast-forward only, refuse to diverge).
@@ -157,14 +158,14 @@ and the error path would then disagree about which store is authoritative).
 > rather than quietly deleted, because the failure mode is the same one behind the
 > C5 "64 KB" figure — a plausible mechanism reasoned about, not measured:
 >
-> - *"a `.f-dirty` marker cannot see a committed-but-unpushed edit and `f up`
->   destroys it."* It does not. The "measurement" cloned a bucket, committed in the
+> - _"a `.f-dirty` marker cannot see a committed-but-unpushed edit and `f up`
+>   destroys it."_ It does not. The "measurement" cloned a bucket, committed in the
 >   clone, reset, then read `HEAD` **in that same clone** — which shows the reset by
 >   construction and says nothing about whether the commit survives `f up`. The
 >   correct repro (throwaway clone, one commit ahead, through `f up`, piped stdin)
 >   shows core skipping the bucket and the commit surviving. `dirtyBuckets()` counts
 >   `@{u}..HEAD` precisely because the author already thought of this.
-> - *"a skip is silent unless verbose."* It is not — the skip is named on stderr
+> - _"a skip is silent unless verbose."_ It is not — the skip is named on stderr
 >   with a count and the `--force` escape, unprompted. Coding against that claim
 >   would have duplicated logic that already works.
 
@@ -172,10 +173,10 @@ and the error path would then disagree about which store is authoritative).
 
 **Reproduced 2026-10-16** on this machine. Two distinct defects.
 
-**(a) A local source pointing *into* the store is an in-place `cpSync`.**
+**(a) A local source pointing _into_ the store is an in-place `cpSync`.**
 
 ```json
-{ "ucks": [ "./ucks/fcli-ucks" ] }     // repo-relative → ~/.f/ucks/fcli-ucks
+{ "ucks": ["./ucks/fcli-ucks"] } // repo-relative → ~/.f/ucks/fcli-ucks
 ```
 
 `installLocal` (`dist/index.ts:301` → bundle `:458`) computes
@@ -186,7 +187,7 @@ tree → `ERR_FS_CP_EINVAL`, uncaught, `f up` dies mid-loop.
 The observed damage in the target bucket: `config/index.js`,
 `config/package.json`, `config/package-lock.json`, `config/.gitignore`,
 `lib/*` deleted (`git status` → 4 tracked deletions + `lib/`), and
-`.f-source.json` overwritten with a *git* provenance pointing at
+`.f-source.json` overwritten with a _git_ provenance pointing at
 `github.com/kensand/fcli-ucks` — so the bucket then claimed to be a clone of
 a repo while its content was a partial local copy.
 
@@ -198,12 +199,13 @@ work was nil). **An author with uncommitted uck edits in a bucket and a
 badly-typed local source loses them.**
 
 Fixes:
+
 - Reject or hard-error any source whose resolved path is inside `storeDir()`
   or inside its own destination. Currently it silently proceeds to `cpSync`.
 - Validate `dest` is not a descendant of `abs` before `cpSync`.
-- Never write `.f-source.json` git provenance from a *local* install path
+- Never write `.f-source.json` git provenance from a _local_ install path
   (`installLocal` writes no manifest at all today — the stray
-  `fcli-ucks-dev` bucket has none; the corruption came from the *git* path
+  `fcli-ucks-dev` bucket has none; the corruption came from the _git_ path
   re-stamping an existing dir).
 
 **(b) `reset --hard` + `clean -fdx` with no author marker.**
@@ -211,15 +213,16 @@ Fixes:
 `installGitSource` (`dist/index.ts:136-145` → bundle `:273-283`) on an
 existing clone does `git reset --hard <target>` then `git clean -fdx -e
 node_modules`. That is correct for a pure cache and catastrophic for the
-model the published `f-uck-creation` skill teaches: *"The store bucket is the
+model the published `f-uck-creation` skill teaches: _"The store bucket is the
 working repo… a git bucket is a live git working tree… edit the bucket
-directly."*
+directly."_
 
 Also: `f up` reads sources for the update loop, but `dirtyBuckets()` skip-logic
-only guards buckets it finds *and* the non-TTY `--force` path discards after a
+only guards buckets it finds _and_ the non-TTY `--force` path discards after a
 single confirm.
 
 Fixes:
+
 - Write a mutation marker (`.f-dirty`) on any in-bucket write by `f uck new`,
   and treat a dirty `git status` as the marker; refuse to `reset --hard` a
   marked bucket even under `--force` unless `--discard`. Clear on clean update.
@@ -232,7 +235,7 @@ Fixes:
 
 **C2 and C5's exit/stdout half shipped in 0.3.1.** C1's local-source half (a)
 also shipped: a source resolving inside the store is refused. The author-bucket
-half of C1 is a *policy* choice, not a bug — see the note at the end of C1.
+half of C1 is a _policy_ choice, not a bug — see the note at the end of C1.
 
 ### C2 — no concurrency safety — **needs core, invisible to the contract**
 
@@ -246,7 +249,7 @@ One lock around store mutation fixes it. No contract surface. **Shipped in
 0.3.1** (`src/lock.ts`), with three corrections to the sketch above:
 
 - **Lock a symlink, not an O_EXCL file.** `symlink()` fails EEXIST when the name
-  exists at all (file, dir, or dangling), and the pid rides in the link *target*
+  exists at all (file, dir, or dangling), and the pid rides in the link _target_
   — so there is no zero-length-file race and no second metadata file to read.
 - **A timeout is not a staleness test.** The obvious "give up after N seconds"
   design steals the lock from a healthy `f up` (which clones several buckets and
@@ -277,15 +280,16 @@ buckets; **exit 1 when any uck is invalid**, so it works as a bucket repo's CI
 gate today.
 
 First run on this machine: 12/15 valid.
+
 - `kensand-fcli-ucks/ha` desc **155** chars and `ha-ws` **135** — both over the
   N10 cap, i.e. silently truncated in `f help` and in every `ctx.ucks`;
 - `fcli-ucks/config` reports `N3 import failed: Cannot find module
-  'jsonpath-plus'` — but that is only an **uninstalled-deps** condition, so
+'jsonpath-plus'` — but that is only an **uninstalled-deps** condition, so
   `check` should detect a missing `node_modules` for a uck that declares deps
   and print `skip (deps not installed)` instead of `BAD`. Needs a fix;
 - correctly did **not** flag the flattened `fcli-ucks-dev` copy (skills paths
   are built from `import.meta.url`, so they resolve truthfully — good
-  property), yet that bucket *does* fail at runtime for `../lib/`, which only
+  property), yet that bucket _does_ fail at runtime for `../lib/`, which only
   N3's import error catches.
 
 **Still needs core (`f doctor`):** the runtime half no uck can observe — which
@@ -312,7 +316,7 @@ before importing `src/cli.js` still loads and dispatches the **operator's real
 store's 15 ucks while the fixture's 2 were absent. Cause: `src/registry.ts`
 evaluates `fHome()` in a module-scope const (`uckMainPath()`), freezing the
 store path at import time, before the test can move `HOME`. Core needs either a
-`F_HOME`/store-dir override read at *call* time or an injectable store dir.
+`F_HOME`/store-dir override read at _call_ time or an injectable store dir.
 
 Workaround used in the meantime (core `test/ctx-contract.test.ts`): spawn the
 built `dist/index.js` as a child process with a scrubbed env. It works, but it
@@ -321,8 +325,8 @@ costs a build, and any test that needs a fake store pays the same tax.
 ### C5 — dispatch and path hardening — **needs core**
 
 - **Unknown uck truncates stdout — FIXED in 0.3.1.** `console.error(...);
-  process.exit(1)` for an unknown uck and in the catch discarded buffered stdout.
-  The claim was right; the *size* in the original note was wrong. Measured: on
+process.exit(1)` for an unknown uck and in the catch discarded buffered stdout.
+  The claim was right; the _size_ in the original note was wrong. Measured: on
   Linux, pipes are synchronous since 2.6.35, so 64 KB / 640 KB / 3 MB all
   survived `exit(1)` intact — three attempts at a regression test measured
   nothing for that reason. It only shows at 52 MB: **0.3.0 delivered 7.4 MB of
@@ -383,21 +387,23 @@ B4 below (which defines the output format that makes this checkable).
 
 Highest value per minute; no code changes.
 
-| doc says | shipped |
-|---|---|
-| README: `"extensions": [...]` as the config key | `readConfigFile` (`:76`) accepts `extensions` only as a legacy fallback; `ucks` is the key |
-| README: git sources need `npm i` first | `installGitSource` clones and runs `npm i` per uck automatically |
-| README: `ctx.ucks` = "all **previously** registered ucks" | full set, computed after all loads (`:828`) |
-| README: `credsApi` = `get/set/ls/unlock/lock/status` | also `getRaw`, `resolve`, `wait`, `waiters`, `providers`, `lookupCred`, `lookupFirst`, `status().remainingMs` |
-| README: no mention of `ctx.uck` | `gh` already uses it as the primary accessor |
-| README: "A one-line `curl … \| sh` bootstrap is coming" | pick a release path or delete the line |
+| doc says                                                        | shipped                                                                                                                                                                                        |
+| --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| README: `"extensions": [...]` as the config key                 | `readConfigFile` (`:76`) accepts `extensions` only as a legacy fallback; `ucks` is the key                                                                                                     |
+| README: git sources need `npm i` first                          | `installGitSource` clones and runs `npm i` per uck automatically                                                                                                                               |
+| README: `ctx.ucks` = "all **previously** registered ucks"       | full set, computed after all loads (`:828`)                                                                                                                                                    |
+| README: `credsApi` = `get/set/ls/unlock/lock/status`            | also `getRaw`, `resolve`, `wait`, `waiters`, `providers`, `lookupCred`, `lookupFirst`, `status().remainingMs`                                                                                  |
+| README: no mention of `ctx.uck`                                 | `gh` already uses it as the primary accessor                                                                                                                                                   |
+| README: "A one-line `curl … \| sh` bootstrap is coming"         | pick a release path or delete the line                                                                                                                                                         |
 | CONTRACT.md §6.2 "`uckApi` … document in the uck uck, not here" | `uckApi` is `{loadTargets,saveTargets,push,bucketUcks}` with push-target naming coupling (`target.name === bucket`) that no doc states; `f uck new`'s default-bucket rule is also undocumented |
-| `f help` truncates `desc` to ≤120 chars | `CONTRACT.md` N10 says 100; `f uck new` scaffold says 120 — three numbers |
+| `f help` truncates `desc` to ≤120 chars                         | `CONTRACT.md` N10 says 100; `f uck new` scaffold says 120 — three numbers                                                                                                                      |
 
-Also: `f ls` interpolates `args._[0]` into `ls -1 ${target}` and `f w` into
-`which ${target}`. Both are the **reference example ucks** in the README and
-both are shell-injection demos. Rewrite with `execFileSync` + argv array —
-the scaffold should demonstrate the safe form, since LLMs copy these files.
+Resolved by removal, not by rewrite: `f ls` (`ls -1 ${target}`) and `f w`
+(`which ${target}`) interpolated arguments into a shell. They were also the
+**reference example ucks** in the README, so the scaffold taught the unsafe form
+to whoever copied it. Both ucks are deleted — `ls -1` and `which` are already on
+`PATH` at zero tokens, so there was nothing to fix. The scaffold in `f uck new`
+should still demonstrate `execFileSync` + argv array, since LLMs copy these files.
 
 ### D2 — the local-source trap is undocumented and unsurfaced
 
@@ -417,6 +423,7 @@ subdirs containing `index.js` are copied, breaking `providers`'
 error in the tree was also the one that mattered most.
 
 Two fixes:
+
 - `f config add ucks <path>` should **refuse or warn loudly** when the path
   is inside `storeDir()` or is a bucket that already has a git source, and say
   "this content is copied once and never updated; use a git URL or `--name`
@@ -431,14 +438,14 @@ Two fixes:
 ## Decided against (recorded so it doesn't resurface)
 
 - **`ctx.dir` (B3).** Approved, then withdrawn on inspection: `import.meta.url`
-  + `path.dirname` yields the same path from **both** the harness and a direct
-  `node index.js` probe, where a harness-provided path would disagree; and
-  `ctx.self` is already load-bearing as the **registered name** (provider probe
-  keys, provenance). So `ctx.dir` would either duplicate a field or rename one,
-  for two lines of import boilerplate. Replaced by **CONTRACT.md S2**, which
-  states the `here` idiom normatively and explains why skill paths must be
-  absolute — they're read from a *different process* than the one that
-  registered them.
+  - `path.dirname` yields the same path from **both** the harness and a direct
+    `node index.js` probe, where a harness-provided path would disagree; and
+    `ctx.self` is already load-bearing as the **registered name** (provider probe
+    keys, provenance). So `ctx.dir` would either duplicate a field or rename one,
+    for two lines of import boilerplate. Replaced by **CONTRACT.md S2**, which
+    states the `here` idiom normatively and explains why skill paths must be
+    absolute — they're read from a _different process_ than the one that
+    registered them.
 - **`ctx.uck()` — deleted, not deprecated (A1).** `registry` is the sole
   accessor. Also kills the earlier "keep `registry`, filter `uck()`" proposal:
   pre-1.0 breaking changes need no migration handling, so there is no reason to
@@ -452,7 +459,7 @@ Two fixes:
   protocol (§5 P4, now a normative table) already carries what's machine-
   readable, `has`/`status` are best-effort by P2/P3, and "printed nothing" is
   already distinguishable from "printed `ready: false`". Revisit only if C6's
-  probe self-test needs to *parse* readiness rather than merely probe it.
+  probe self-test needs to _parse_ readiness rather than merely probe it.
 - **Output formatting as contract.** Stays style, per §0.
 
 ### C8 — `npm test` tests the previous build — **new, found 0.3.1**
@@ -466,4 +473,3 @@ test stayed red, and only `npm run build` turned it green.
 Fix: `"pretest": "npm run build"` — or drop `dist/` from git and always build, so
 CI cannot test a stale artifact either. Cheap, and it removes a whole class of
 "but my test passed".
-

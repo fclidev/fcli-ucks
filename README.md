@@ -13,8 +13,6 @@ subdirectory is one uck, entered through its `index.js`.
 ```
 fcli-ucks/
   v/index.js
-  w/index.js
-  ls/index.js
   config/index.js
   creds/index.js
   uck/index.js
@@ -27,8 +25,6 @@ fcli-ucks/
 
 ```
 ~/.f/ucks/v/index.js
-~/.f/ucks/w/index.js
-~/.f/ucks/ls/index.js
 ~/.f/ucks/config/index.js
 ~/.f/ucks/creds/index.js
 ~/.f/ucks/uck/index.js
