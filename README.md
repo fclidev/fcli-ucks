@@ -19,6 +19,7 @@ fcli-ucks/
   creds/index.js
   uck/index.js
   skills/index.js
+  search/index.js
 ```
 
 `f` downloads this repo on first install (it's seeded into
@@ -32,7 +33,30 @@ fcli-ucks/
 ~/.f/ucks/creds/index.js
 ~/.f/ucks/uck/index.js
 ~/.f/ucks/skills/index.js
+~/.f/ucks/search/index.js
 ```
+
+## Discovery: `f search`
+
+`f` itself prints uck **names** only — a name+description listing grows linearly
+with the store, so it cannot be the default surface. `search` is the other half:
+it ranks ucks against a query and returns short descriptions for the matches.
+
+It lives here rather than in f core so ranking can be tuned without cutting an f
+release. Two properties follow from being a uck, and `search/index.js` handles
+both:
+
+- **It must not find itself.** `ctx.ucks` is complete at run time and includes
+  this uck, whose description mentions "rank", "ucks", "query", "name" and
+  "description" — so unfiltered it surfaces on most queries. Filtered via
+  `ctx.self`.
+- **`--help` needs a declared `.help`.** Core only intercepts bare `f search`,
+  `--help` and `-h` when the uck provides `.help`/`.about`. Without declaring it,
+  `f search --help` reaches `run()` as a query and answers "no uck matched:
+  --help" — which reads as a working command that found nothing, when the caller
+  asked how to use it.
+
+Unknown flags are refused (exit 2) rather than scored as search text.
 
 ## Format
 
