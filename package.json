@@ -23,7 +23,7 @@
     "cli"
   ],
   "author": "fcli.dev",
-  "license": "AGPL-3.0",
+  "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/fclidev/fcli-ucks.git"

@@ -90,4 +90,4 @@ Existing installs pick it up on `f up`.
 
 ## License
 
-AGPL-3.0. See [LICENSE](./LICENSE).
+GPL-3.0. See [LICENSE](./LICENSE). This repository is licensed separately from the f CLI ([github.com/fclidev/fcli](https://github.com/fclidev/fcli)); ucks may be redistributed, modified, or relicensed under their own terms.
