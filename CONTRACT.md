@@ -1,7 +1,9 @@
 # The f ↔ uck contract
 
-**Status: v1 — implemented in f 0.3.0 (core) and the uck buckets (Oct 2026).**
-All GAPs G1–G10 are resolved as described below; the GAP register (§9) is kept
+**Status: v2 — v1 was implemented in f 0.3.x (core) and the uck buckets (Oct
+2026); v2 is G11 (core 0.4.0): register-time ctx no longer carries `ucks`/
+`registry`.**
+All GAPs G1–G11 are resolved as described below; the GAP register (§9) is kept
 as the change history. `credsApi.version: 1` is live (CredsError with `.kind`);
 peers in the personal bucket classify structurally with a message fallback for
 older creds builds. This document is the diff-able baseline for 1.0.
@@ -183,31 +185,102 @@ and is therefore at risk of drifting.)*
 
 ## 3. `ctx`
 
-- **N18.** At **register time**: `ctx = { fVersion, contractVersion, self,
-  ucks, registry }`.
+- **N18.** At **register time**: `ctx = { fVersion, contractVersion, self }`.
   - `fVersion`: `string`, the installed f semver.
-  - `contractVersion`: `number` — **A2, implemented.** The f↔uck contract
-    version this core implements (core exports `CONTRACT_VERSION`, currently
-    `1`). A uck written against the 1.0 ctx must be able to tell a 1.0 core
-    from a future one that drops a key this ctx still carries; `fVersion`
-    cannot answer that, being a core release number and not an interface one.
+  - `contractVersion`: `number` — **A2, implemented; G11 bumps it to 2.** The f↔uck
+    contract version this core implements (core exports `CONTRACT_VERSION`).
+    A uck written against a given ctx must be able to tell a core from a future
+    one that drops a key this ctx still carries; `fVersion` cannot answer that,
+    being a core release number and not an interface one. It is now the **only**
+    pre-run signal, because it is the only pre-run question left: register()
+    cannot ask who its peers are.
   - `self`: `string`, the uck's **registered name** (i.e. what `f <self>`
     invokes). For a directory registering multiple ucks this is *wrong* for
     all but the first — *(GAP G10: guarantee one uck per directory, or
     pass the directory path as `self` and add `selfName` for the registered
     name.)*
-  - `ucks` / `registry`: present here too (G4) — register-time and run-time are
-    **one shape**, one ctx to learn. See N20a for the partial-view caveat,
-    which is the only real constraint.
+  - **`ucks` and `registry` are ABSENT at register time (G11, reversed from the
+    original G4).** See §3.1 for why absent rather than empty, and §3.2 for the
+    migration grep.
 - **N19.** At **run time**: `ctx = { fVersion, contractVersion, self, ucks,
-  registry }` — identical keys to register time (N18). Core builds both from
-  one shape, so they cannot drift apart.
-  - `ucks`: `[{ name, desc }]` for every registered uck — **the full set**, not
-    the previously-registered subset — i.e. the same data `f help` prints.
+  registry }` — a strict **superset** of the register-time ctx. Direction
+  matters: register ctx ⊂ run ctx, so anything written against register ctx
+  remains valid in `run`, and not vice versa.
+  - `ucks`: `[{ name, desc }]` for every registered uck — **the full set**.
     Intended for LLM-facing discovery, cheap to include.
   - `registry`: **plain object** (not a `Map`) of every registered uck object,
     keyed by name. This is the **only** sanctioned way to reach another uck's
     peer API.
+  - `ctx` is rebuilt per invocation, so nothing captured from an earlier run
+    can go stale.
+
+### 3.1 Why register-time `registry` is absent, not empty (G11)
+
+v1 handed `register()` a *partial* view — "whatever has loaded so far" — with
+N20a as the rulebook ("feature detection only"). That rule existed to protect
+uck authors from a property of the loader that the rule could not actually fix.
+
+The partial view is not keyed on a stable order. In `loadStoreUcks` the pass
+accumulates, but npm sources are merged by the **caller afterwards**:
+
+```js
+// store buckets: accumulating — visibility depends on bucket name order
+const loaded = await loadUckModule(indexPath, name, fVersion, origin, snapshot(results));
+results.push(...loaded);
+
+// npm sources: merged on top by the caller
+//   → a store uck can NEVER see an npm uck at register time
+//   → an npm uck ALWAYS sees the entire store
+```
+
+So `"creds" in ctx.registry` did not merely depend on order; it depended on
+**which kind of source the peer came from**, in one direction only. Rename a
+bucket and alphabetical order flips. There is no correct uck to write against
+that, which is the definition of a race condition rather than an interface.
+
+Three candidate fixes, and why only the third holds:
+
+| register-time `registry` | `ctx.registry.x = y` (mutation) | `"creds" in ctx.registry` | state space |
+|---|---|---|---|
+| partial view (v1) | silently discarded — the snapshot is thrown away and rebuilt per uck | order-dependent, **can be false for a peer that is installed** | 3, indistinguishable |
+| `Object.freeze({})` | throws ✓ | present but **always false** ✗ | 2 |
+| **absent (v2)** | throws ✓ | **throws** ✓ | 1 |
+
+The freeze row is the trap. It looks like it keeps the documented idiom alive
+while removing the race, and it does something worse: it converts a sometimes
+answer into a **guaranteed-wrong** answer. Every uck that obeyed N20a and wrote
+`"creds" in ctx.registry` would get `false`, fall through to the §6.1 C3 socket
+fallback, and report `no-store` — which reads to an operator as *no credential
+configured*. That is precisely the failure N20 refuses for `ctx.uck`: *"A
+half-migrated uck is worse than an unmigrated one."*
+
+Absent is the same argument N20 already made about `ctx.uck`, applied to its
+conclusion: **deleting the key fails loud rather than degrading silently.**
+`ctx.registry.creds` → `TypeError: Cannot read properties of undefined`; the
+`in` operator throws on a primitive. Both surface at load, in the uck's own
+`register()`, next to the line that caused it. It also buys the one distinction
+the partial view could never make — *absent* vs *present-but-empty* — by
+removing the empty case.
+
+This is a **contract-level** change, not an implementation detail: it changes
+the meaning of an existing ctx field for code already written, which is exactly
+`CONTRACT_VERSION`'s stated bump rule. Hence **v2**, not a quiet patch.
+
+### 3.2 Migration (one grep per bucket)
+
+```bash
+grep -rn "ctx\.registry\|ctx\.ucks" --include=*.js . | grep -v node_modules
+# then check: is each hit lexically inside run(...)? If not, it must move.
+```
+
+Peer work in `register()` cannot be preserved, and should not be: a provider is
+spawned as a child (§5 P4/P5) and must re-derive everything anyway, so
+register-time `registry` was never a real peer channel. Measured adoption on
+the two installed buckets plus the core example: **zero register-time readers**
+— 7 peer sites (`fj`, `grocy`, `ha`, `ha-ws`, `skills`, `search`, `gh`) are all
+inside `run`, and the only trace of the partial view in any uck is a *warning
+comment about it* (core's own `examples/df-ext/index.js`). A change with this
+little traction is cheap now and expensive after 1.0.
 - **N20. `ctx.registry` is the one peer accessor. `ctx.uck(name)` is deleted —
   no deprecation cycle.** *(A1, implemented: the key is absent from both ctx
   objects, so a uck still calling it fails loud rather than degrading to a
@@ -221,8 +294,13 @@ and is therefore at risk of drifting.)*
     isolation, since peer objects are unsandboxed and a proxy hides key names,
     not powers;
   - load order is contract-relevant (N9 shadowing/last-wins; §6.3 skill
-    merging spans every uck) and only the map answers "what did I shadow?";
-  - `registry` is the only one that can exist at register time (N20a).
+    merging spans every uck) and only the map answers "what did I shadow?".
+
+  *(N20's third original argument — "`registry` is the only one that can exist
+  at register time (N20a)" — was overtaken by G11: `registry` no longer exists
+  at register time either. It argued `registry` vs `uck()`, and `registry` still
+  wins that contest on the two grounds above; it simply no longer wins it by
+  being available earlier.)*
 
   Pre-1.0 breaking changes need no migration handling, and the failure mode is
   loud anyway: `ctx.uck("creds")` → `f: ctx.uck is not a function`.
@@ -244,11 +322,10 @@ and is therefore at risk of drifting.)*
   keys, or delete a peer; registration happens only via `register()`. Nothing
   enforces this in 0.x; mutation is unsupported.
 
-  At **register time** `registry` is a **partial view**: only ucks loaded
-  before yours are present (imports proceed in store order and `register()`
-  runs during that walk). Use it there for *feature detection* only —
-  `"creds" in ctx.registry` — never for an authoritative peer lookup. Reach
-  peers for real in `run`, where the view is complete.
+  `registry` exists at **run time only** (G11). The register-time ctx does not
+  carry the key, so there is no partial view, no feature-detection caveat, and
+  nothing to get wrong before `run` — N20a's "use it there for feature detection
+  only" rule is **retired**: the question it regulated can no longer be asked.
 - **N20b.** `ctx` and everything reachable from it must be
   **structured-cloneable** — no sockets, child processes, open fds, or class
   instances with private fields hung off it. Providers are spawned as children
@@ -527,7 +604,8 @@ Node loads a second module instance with a second class identity, and
 | G1 | ⌛ done in 0.3.0 | `ctx.fVersion` is the negotiation point; add uck `minF`, warn on mismatch | core | S | yes |
 | G2 | ⌛ done in 0.3.0 | Enforce `desc` one-line + length cap in loader; add `about` for multi-line usage | core | S | yes |
 | G3 | ⌛ done in 0.3.0 | Exit semantics: rule "failure = throw or non-zero `process.exitCode`"; loader rejects non-`undefined` returns (or maps to exitCode); document the `process.exit(0)`-on-failure ban | core | S | yes |
-| G4 | ◐ run ctx shipped; 1.0 = add `ucks`/`registry` at register time, **delete `ctx.uck`** | One `ctx` shape everywhere. **Decision reversed:** `registry` is the sole accessor; `uck()` is deleted outright, no deprecation cycle (5 of 6 in-tree sites already used `registry`). See N20/N20a | core + `gh` | S | yes (1.0) |
+| G4 | ⌛ done in 0.3.x, **then superseded by G11** | One `ctx` shape everywhere. `registry` is the sole peer accessor; `uck()` deleted outright, no deprecation cycle (5 of 6 in-tree sites already used `registry`). The "same keys at register time" half of this is reversed by G11 — see N18/N20 | core | S | yes (1.0) |
+| G11 | ⌛ done — core drops `ucks`/`registry` from register ctx, `CONTRACT_VERSION` → 2 | **Reverse G4's register-time half.** Register ctx = `{fVersion, contractVersion, self}`; run ctx unchanged. The v1 partial view was keyed on load order *and source kind* (npm merges after the store pass), so no uck could depend on it correctly. Empty-object is not a substitute: it makes the documented `"creds" in ctx.registry` idiom guaranteed-false and degrades to a `no-store` that reads as "not configured" — the N20 footgun, promoted from race to law. Absent fails loud instead. Retires N20a. Migration = the §3.2 grep (0 in-tree register-time readers). Bumps the contract version, per its own bump rule | core + buckets | S | yes (1.0) |
 | G5 | ⌛ done — CredsError + credsApi.version=1 in creds; peers classify structurally (msg fallback kept) | Typed `CredsError` + `credsApi.version` + `providerVersion`; replace the `/locked/i` regex sites in ssh/gh/ha/fj; document the creds socket protocol in this doc | creds + 4 ucks | M | yes |
 | G6 | ⌛ done in 0.3.0 (registry always shipped) | Published f must ship `registry` in run ctx; until then peers degrade gracefully (stated rule, §4) | core | S | yes |
 | G7 | ⌛ done — package.json standardized, `f uck new` scaffolds, uckmain copied per bucket, doc path fixed | Standardize `package.json` (`{"name","type":"module"}`); scaffold via `f uck new`; kill cross-bucket imports (ship `uckmain` per bucket or as npm pkg) | tooling + buckets | S | no |
@@ -537,10 +615,16 @@ Node loads a second module instance with a second class identity, and
 
 **Implemented cut (Oct 2026):** core 0.3.0 ships G1/G2/G3/G6/G8/G9/G10;
 creds ships G5 (CredsError, `credsApi.version: 1`); the uck buckets ship G7.
-**Remaining for 1.0** (G4, reversed decision): add `ucks`/`registry` to the
-register-time ctx and **delete `ctx.uck`** — no deprecation cycle, since
-pre-1.0 breaking changes need no migration handling. `registry` itself never
-goes away. Un-numbered harness/doc work: `ROADMAP-1.0.md`.
+
+**Remaining for 1.0:** the ctx work is now closed in both halves. **G4** —
+`ctx.uck` deleted, `registry` the sole run-time accessor (done in 0.3.x).
+**G11** — register ctx reduced to `{fVersion, contractVersion, self}`, which
+reverses G4's "same keys at register time" half and retires N20a. Both landed
+without a deprecation cycle, since pre-1.0 breaking changes need no migration
+handling; G11 is the reason `CONTRACT_VERSION` is 2 and why a core minor
+(0.4.0) is not optional — a uck cannot tell a v1 and a v2 core any other way.
+`registry` itself never goes away; only its register-time appearance did.
+Un-numbered harness/doc work: `ROADMAP-1.0.md`.
 
 **Original suggested cut:** G1+G2+G3+G6+G9 as one core **minor** (0.3, additive);
 G5 as creds **minor** (back-compat: old message matching still works until
@@ -550,6 +634,9 @@ interception, one-uck-per-dir). G7 anytime.
 ## 10. What stays
 
 - `register`/`run` as the only two required surface points.
+- **`run` as the only place a uck can see another uck** (G11). If peer discovery
+  ever needs to move earlier, that is a new contract version and a new argument,
+  not a reinstated partial view.
 - The three-outcome `resolve` (hit / not-mine / throw) — it is the best part
   of the ecosystem and should not be touched.
 - Bag-of-dirs buckets, in-place execution, uck-local `node_modules`.
