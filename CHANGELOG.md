@@ -1,0 +1,42 @@
+# Changelog
+
+All notable changes to the default uck bundle.
+
+## [0.2.1]
+
+### Changed
+- Added the `fcli-uck` keyword to package.json for npm search.
+- `assemble` wipes `dist/` before copying, preventing stale files in the published bundle.
+- `assemble` lists every uck in the manifest, not just those with dependencies.
+
+### Fixed
+- Removed `ls` and `w` ucks (superseded by `f`'s own index and `f v`).
+- Moved discovery ranking out of core into the `search` uck.
+
+## [0.2.0]
+
+### Added
+- Initial tagged release as `@fcli.dev/ucks` on npm.
+- **creds** — encrypted credential store with TTL daemon, provider layer (Vaultwarden, local files), packed files (`f creds files pack/unpack/ls/rm`), cross-terminal cred supply (wait/request), passkey verifier, redaction by default.
+- **skills** — markdown instruction files loaded into context on demand; per-uck skill exports merged with config skills.
+- **config** — `f config add/remove/get/ls` with JSONPath; refuses uck sources that point into the store.
+- **fj** — Forgejo/Gitea: all 491 endpoints.
+- **gh** — GitHub via @octokit/rest.
+- **ha** — Home Assistant: states, scenes, automations, history, weather, calendars.
+- **vaultwarden** — read secrets from a Vaultwarden vault.
+- **ssh** — ssh/scp/rsync with a key from the creds store (never touches disk).
+- **pi-models** — save/restore `~/.pi/agent/models.json` in the encrypted store.
+- **df** — disk usage report.
+- **grocy** — stock, shopping list, recipes, chores, tasks.
+- **search** — ranks installed ucks against a query (moved out of core in 0.2.1).
+- **v** — version info.
+
+### Fixed
+- creds: `set` reads value from stdin; mirror deletes carry provenance.
+- creds: `ls --json` respected; mirror metadata displayed.
+- creds: unknown `--flag` no longer became unlock's passkey.
+- creds: successful `set` no longer exited 1.
+- creds: 25 tests; suite was silently skipping everything appended after the first.
+- creds: stop provider discovery from recursing into itself.
+- config: `add` no longer silently discards the value (C7).
+- uck: quote-free description no longer broke YAML frontmatter parsing.
