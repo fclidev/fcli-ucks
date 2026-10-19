@@ -2,6 +2,29 @@
 
 All notable changes to the default uck bundle.
 
+## [0.3.0]
+
+### Changed
+- **Documented contract target is v2.** CONTRACT.md records G11: register-time
+  ctx is `{fVersion, contractVersion, self}` only — no `ucks`, no `registry`.
+  `run()` is unchanged and is now the only place a uck can see a peer. Requires
+  core `@fcli.dev/f` v0.4.0, which ships `CONTRACT_VERSION: 2`.
+  This is a documentation-only change in this repo: no shipped uck read a peer
+  at register time, so every uck here works unchanged against both cores. The
+  bump is major-in-spirit because the *documented* interface lost a field —
+  a bundle at 0.2.x read alongside core 0.4.0 would describe a ctx that no
+  longer exists.
+- `search`: dropped the `.help` export so bare `f search` prints usage from
+  `run()` without the G8 interceptor's `search  rank ucks…` header; `--help`
+  and `-h` are handled as tokens instead.
+- `skills`: bare `f skills` now lists skills, which was the useful default.
+  Reading the default skill is explicit: `f skills show default`.
+- `uck`: the N6 warning names both sides — registered name and dir — instead of
+  only the dir.
+
+### Added
+- CHANGELOG.md.
+
 ## [0.2.1]
 
 ### Changed
