@@ -118,13 +118,8 @@ export function register(_ctx) {
   return {
     name: "search",
     desc: "rank ucks against a query (name, then description)",
-    // Declared, not printed from run(). Core intercepts bare `f search`,
-    // `--help` and `-h` only when a uck provides .help or .about (src/cli.ts
-    // isBareHelp), so declaring it is what makes `f search --help` show usage.
-    // Without it, "--help" falls through as a search term and the uck answers
-    // "no uck matched: --help" — which reads as a working command that found
-    // nothing, when the caller actually asked it how to work.
-    help: USAGE,
+    // No .help export: bare `f search` falls through to run(), which prints
+    // clean usage without the G8 interceptor's `search  rank ucks…` header.
     run: (argv, args, ctx) => {
       // Reject flags rather than searching for them. Without this, `f search
       // --verbose` scores "verbose" as a query term and answers "no uck
@@ -134,6 +129,10 @@ export function register(_ctx) {
       // and does nothing.
       const pos = [];
       for (const a of args._ ?? []) {
+        if (a === "--help" || a === "-h") {
+          process.stdout.write(USAGE);
+          return;
+        }
         if (a.startsWith("-")) {
           process.stderr.write(`f: search: unknown flag '${a}'\n`);
           process.stderr.write(USAGE);

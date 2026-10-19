@@ -234,7 +234,7 @@ function usage(msg) {
     line +
       "usage: f skills [-g] <op> [args]\n" +
       "  ops:\n" +
-      "    (none)              show the default skill\n" +
+      "    (none)              list skills\n" +
       "    search <query>      find relevant skills (name + content)\n" +
       "    ls                  list skills (name + path)\n" +
       "    show <name>         print a skill's markdown content\n" +
@@ -267,11 +267,14 @@ export function register(ctx) {
       const [op, a, b] = pos;
       const registry = ctx && ctx.registry;
 
-      // Bare `f skills` → show the default skill.
+      // Bare `f skills` → list skills (the useful default). Reading the
+      // default skill is explicit: `f skills show default`.
       if (!op) {
-        const r = skillsApi.show("global", "default", registry);
-        if (r && !r.missing) return process.stdout.write(r.content);
-        return usage();
+        const list = skillsApi.ls(target, registry);
+        if (list.length === 0) return process.stdout.write("");
+        for (const s of list)
+          process.stdout.write(`${s.name}\t${s.path ?? "(inline)"}\n`);
+        return;
       }
 
       switch (op) {

@@ -351,7 +351,7 @@ async function checkOne(entry) {
       if (u.desc.includes("\n")) problems.push(`N10 ${label}: desc has a newline`);
       if (u.desc.length > DESC_MAX) problems.push(`N10 ${label}: desc ${u.desc.length} > ${DESC_MAX} chars`);
     }
-    if (u.name && u.name !== entry.dirName) problems.push(`N6 ${label}: dir is '${entry.dirName}'`);
+    if (u.name && u.name !== entry.dirName) problems.push(`N6 ${label}: registered name '${u.name}' does not match dir '${entry.dirName}'`);
     for (const s of u.skills ?? []) {
       const p = typeof s === "string" ? null : s.path;
       if (!p) problems.push(`S2 ${label}: skill '${typeof s === "string" ? s : s.name}' has no path`);
