@@ -6,5 +6,3 @@ export function register(ctx) {
   };
 }
 export default { register };
-
-const ;
