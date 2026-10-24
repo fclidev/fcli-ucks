@@ -2,7 +2,7 @@
 
 All notable changes to the default uck bundle.
 
-## [Unreleased]
+## [0.4.0]
 
 ### Added
 - **`creds`: permanent file-based unlock.** `f creds unlock --permanent`
@@ -35,6 +35,17 @@ All notable changes to the default uck bundle.
 - `creds`: auto-unlock clears a stale socket before spawning, so recovery
   after `kill -9`/OOM/reboot reports the real cause instead of "socket already
   in use".
+
+### Notes
+- `@fcli.dev/ucks@0.4.0` requires nothing new from core: `@fcli.dev/f` 0.4.0
+  (contract v2) is still the peer. `credsApi.version` is a creds-level number,
+  not the contract version.
+- `npm test` is broken independently of this release and is NOT run by CI.
+  `config/config.test.js` is a vitest suite but `package.json` runs it under
+  `node --test`, which cannot resolve `vitest`. The creds suites are plain
+  node and do run: `node creds/test/cli.test.mjs` (35) and
+  `node creds/test/permanent.test.mjs` (23). Fixing the test script is open
+  work, not a gate for this release.
 
 ## [0.3.0]
 

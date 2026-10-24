@@ -1,6 +1,6 @@
 {
   "name": "@fcli.dev/ucks",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Default ucks for f (fcli) — the bundle that f installs into the store",
   "type": "module",
   "files": [
