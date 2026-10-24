@@ -2,6 +2,40 @@
 
 All notable changes to the default uck bundle.
 
+## [Unreleased]
+
+### Added
+- **`creds`: permanent file-based unlock.** `f creds unlock --permanent`
+  keeps the store open with no expiry and reads the passkey from a 0600 key
+  file (`~/.f/.creds-unlock.key`, `--key-file` to relocate) instead of a
+  prompt. A marker (`~/.f/.creds-unlock`) lets any creds command restart the
+  daemon itself after a reboot or crash, so no resident process, systemd unit
+  or cron entry is needed. `f creds lock` removes the marker so `lock` means
+  what it says; `--purge` deletes the key file too. `credsApi.version` → 2
+  (`unlock` takes an options object, `lock` takes `{purge}`, and
+  `get`/`set`/`ls`/`resolve` may start a permanent daemon themselves).
+  Generation only applies to a brand-new store: `--permanent` refuses to
+  fabricate a key for an existing one. Threat model is "secret in a 0600
+  file", the same as an SSH private key — documented in the uck README.
+
+### Fixed
+- `creds`: the unlock probe issued `ls`, which decrypted every entry; on a
+  large box it blew the 1.5s probe budget, so `unlock` unlinked a healthy
+  socket and started a **second daemon** against the same box — two writers
+  racing `writeFileSync` and losing entries. The daemon now answers a `ping`
+  op that decrypts nothing.
+- `creds`: `unlock` decided success by watching for the socket *file*, which
+  cannot distinguish "wrong passkey" from "still starting", and `unref()`d the
+  detached daemon before reading its verdict — so a failed unlock could exit 0
+  and `f creds unlock && deploy` would deploy. The daemon now announces
+  `{ok, ttl, permanent, error}` on stdout and the CLI waits for it.
+- `creds`: a daemon that lost the socket race no longer overwrites the
+  lockfile with its own dead pid, which had hidden the live daemon from
+  `status`/`unlock` and invited a second daemon.
+- `creds`: auto-unlock clears a stale socket before spawning, so recovery
+  after `kill -9`/OOM/reboot reports the real cause instead of "socket already
+  in use".
+
 ## [0.3.0]
 
 ### Changed

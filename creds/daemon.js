@@ -21,7 +21,56 @@ for (let i = 0; i < argv.length; i++) {
 const SOCKET = args.socket;
 const LOCKFILE = args.lockfile;
 const CREDS = args.creds;
-const TTL_SEC = Number(args.ttl) || 600;
+// `0` is a meaningful value here, not an absent one, so it must not go through
+// `|| 600` — that is how a permanent unlock would silently become a 10-minute one.
+const TTL_RAW = Number(args.ttl);
+const TTL_SEC = Number.isFinite(TTL_RAW) ? TTL_RAW : 600;
+
+/* ------------------------------------------------------- permanent unlocks */
+/*
+ * `--ttl 0` means *permanent*: no expiry timer, and the lockfile carries
+ * `permanent: true` so `f creds status` can say so instead of inventing a
+ * countdown. The key is still only ever in memory — permanence is about the
+ * session, not about writing a key anywhere. See index.js for who is allowed to
+ * request this (`--permanent`, which requires an unlock key file).
+ */
+const PERMANENT = TTL_SEC === 0;
+
+// Tell the CLI our final TTL/permanence BEFORE it may `unref()` + detach us.
+// Exactly one announcement is ever delivered: the first. A later one — e.g. the
+// SIGTERM teardown in `shutdown()` — would otherwise overwrite the success line
+// the CLI is still reading and turn a good unlock into a reported failure.
+let announced = false;
+function announce(ok, detail) {
+  if (announced) return;
+  announced = true;
+  try {
+    process.stdout.write(
+      JSON.stringify({
+        ok,
+        ttl: TTL_SEC,
+        permanent: PERMANENT,
+        socket: SOCKET,
+        ...(detail ? { error: String(detail).split("\n")[0] } : {}),
+      }) + "\n"
+    );
+  } catch {}
+}
+
+// stdout to a pipe is asynchronous: without draining, `process.exit()` can drop
+// the announcement and the CLI would read "daemon did not start" for a daemon
+// that answered correctly.
+async function flushStdout() {
+  try {
+    if (process.stdout.writableNeedDrain) {
+      await new Promise((r) => {
+        const done = () => r();
+        process.stdout.once("drain", done);
+        setTimeout(done, 250).unref();
+      });
+    }
+  } catch {}
+}
 
 // Read passkey from stdin (never argv — argv is visible in ps).
 function readStdin() {
@@ -246,6 +295,14 @@ const server = net.createServer((socket) => {
           resp = { ok: true, count: n };
           break;
         }
+        // The CLI's "is a daemon alive?" probe. Must not decrypt anything:
+        // `ls` iterated every entry and a large box could blow the probe's 1.5s
+        // budget, which made `unlock` unlink a perfectly good socket and start a
+        // SECOND daemon with the same key. Two writers to one box then race
+        // `writeFileSync` against each other and lose entries.
+        case "ping":
+          resp = { ok: true, permanent: PERMANENT };
+          break;
         // Bulk write. Each item {name, value}(utf8) or {name, b64}(raw). Stages
         // every item before touching the box, so one bad item aborts the whole pack.
         case "import": {
@@ -315,6 +372,8 @@ process.on("SIGINT", shutdown);
 let passkey = await readStdin().then((s) => s.trim());
 if (!passkey) {
   process.stderr.write("daemon: no passkey\n");
+  announce(false, "no passkey");
+  await flushStdout();
   process.exit(1);
 }
 
@@ -338,6 +397,8 @@ key = deriveKey(passkey, box.salt);
       // The single most important line in this file. Without it a wrong passkey
       // reported success and then corrupted the store on the first `set`.
       process.stderr.write("daemon: wrong passkey\n");
+      announce(false, "wrong passkey");
+      await flushStdout();
       process.exit(4);
     }
     if (bad) {
@@ -348,6 +409,8 @@ key = deriveKey(passkey, box.salt);
         `daemon: passkey matches the store but '${bad}' does not decrypt with it — the box mixes keys. ` +
         `Restore a backup or drop that entry; refusing to serve or write.\n`
       );
+      announce(false, "mixed-key box");
+      await flushStdout();
       process.exit(4);
     }
   } else if (!bad) {
@@ -382,24 +445,41 @@ if (Number.isFinite(EXPIRES_AT)) {
 }
 
 server.listen(SOCKET, () => {
+  // The lockfile is the CLI's only window into this process, so the daemon's
+  // final TTL decision is recorded here — not echoed back through argv, where
+  // a `0` would be falsy and read as "no TTL set".
   fs.writeFileSync(
     LOCKFILE,
-    JSON.stringify({ pid: process.pid, start: Date.now(), ttl: TTL_SEC, socket: SOCKET }),
+    JSON.stringify({
+      pid: process.pid,
+      start: Date.now(),
+      ttl: PERMANENT ? null : TTL_SEC,
+      permanent: PERMANENT,
+      socket: SOCKET,
+    }),
     { mode: 0o600 }
   );
+  // Last line the CLI waits for. It must arrive before the parent unrefs us:
+  // once detached AND unref'd there is nothing keeping the parent alive, so an
+  // EADDRINUSE exit can race the parent straight past its own event loop.
+  announce(true);
 });
 
-// Auto-exit after TTL.
-const timer = setTimeout(shutdown, TTL_SEC * 1000);
-timer.unref();
+// Auto-exit after TTL — except for a permanent unlock, which has no deadline
+// and exits only on SIGTERM (`f creds lock`) or a crash.
+if (!PERMANENT) {
+  const timer = setTimeout(shutdown, TTL_SEC * 1000);
+  timer.unref();
+}
 
 server.on("error", (e) => {
   if (e.code === "EADDRINUSE") {
-    // Another daemon already owns the socket; clean up and exit.
-    try {
-      fs.unlinkSync(LOCKFILE);
-    } catch {}
-    process.exit(0);
+    // Another daemon already owns the socket. Exit BEFORE writing a lockfile:
+    // overwriting it would point the lock at our dead pid and make the live
+    // daemon invisible to `status`/`unlock`, which then try to start a second
+    // daemon against the same box.
+    announce(false, "socket already in use");
+    void flushStdout().then(() => process.exit(0));
   }
   throw e;
 });

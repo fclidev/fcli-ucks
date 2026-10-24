@@ -9,6 +9,7 @@ import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryE
 
 import net from "node:net";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -22,6 +23,93 @@ const SOCKET = path.join(F, ".creds.sock");
 const LOCKFILE = path.join(F, ".creds-daemon");
 const DAEMON = path.join(__dirname, "daemon.js");
 const DEFAULT_TTL = 600; // 10 min
+
+/* ------------------------------------------------ permanent file-based unlock */
+/*
+ * `f creds unlock --permanent` keeps the store open indefinitely and supplies
+ * the passkey from a 0600 file instead of a prompt, so nothing has to type a
+ * passphrase after a reboot. Two files, both under ~/.f:
+ *
+ *   UNLOCKKEY  the passkey itself (a 32-byte random hex string by default)
+ *   UNLOCKMARK intent marker: exists => auto-start a permanent daemon on demand
+ *
+ * The threat model is exactly "a secret in a 0600 file", the same one as an SSH
+ * private key: any process running as this uid, and root, can read it. Nothing
+ * here is magic — the store's encryption is unchanged, only the way the key
+ * reaches the daemon differs. `f creds lock` removes BOTH, so locking is a
+ * deliberate act twice over and a stray `f creds get` cannot resurrect the box.
+ */
+const UNLOCKKEY = path.join(F, ".creds-unlock.key");
+const UNLOCKMARK = path.join(F, ".creds-unlock");
+
+/** "permanent" in human terms. A permanent unlock has no deadline, so quoting
+ *  the uptime back as a countdown would be a lie about the thing we changed. */
+function describeUnlock(state) {
+  if (!state) return "locked";
+  if (state.permanent) {
+    const key = readPermanentKey();
+    return `unlocked (permanent, since ${fmt(state.remainingMs)}${key ? `, key file: ${key}` : ""})`;
+  }
+  return `unlocked (${fmt(state.remainingMs)} left)`;
+}
+
+/** Marker + key file path, when a permanent unlock is configured. Returns the
+ *  path or null; does not say whether the key file is readable. */
+function readPermanentKey() {
+  try {
+    if (!fs.existsSync(UNLOCKMARK)) return null;
+    const j = JSON.parse(fs.readFileSync(UNLOCKMARK, "utf8"));
+    if (!j || typeof j !== "object") return null;
+    return typeof j.keyFile === "string" && j.keyFile ? j.keyFile : UNLOCKKEY;
+  } catch {
+    return null;
+  }
+}
+
+/** Read the unlock key. Strict on permissions: a group/world-readable or
+ *  non-regular key file means someone else can have it, and unlocking with it
+ *  would silently launder that exposure as "authenticated". */
+function readUnlockKeyFile(file) {
+  let st;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    return { error: `${file} does not exist` };
+  }
+  if (!st.isFile()) return { error: `${file} is not a regular file` };
+  const mode = st.mode & 0o777;
+  if (mode & 0o077) {
+    return {
+      error:
+        `${file} is mode ${mode.toString(8)} — refusing to use a group/world-readable unlock key. ` +
+        `Fix with: chmod 600 ${file}`,
+    };
+  }
+  const key = fs.readFileSync(file, "utf8").trim();
+  if (!key) return { error: `${file} is empty` };
+  return { key, file };
+}
+
+/** Remove the permanent-unlock intent + key file. Used by `lock`, and by a
+ *  failed auto-unlock so a broken key file cannot spew a warning on every
+ *  subsequent creds command. */
+function clearPermanentUnlock({ removeKey = false } = {}) {
+  const errs = [];
+  const configured = readPermanentKey();
+  try {
+    fs.unlinkSync(UNLOCKMARK);
+  } catch (e) {
+    if (e.code !== "ENOENT") errs.push(`${UNLOCKMARK}: ${e.message}`);
+  }
+  if (removeKey && configured) {
+    try {
+      fs.unlinkSync(configured);
+    } catch (e) {
+      if (e.code !== "ENOENT") errs.push(`${configured}: ${e.message}`);
+    }
+  }
+  return errs;
+}
 
 /** Mirror entries are vault-sourced and expire; stamp the expiry on store. */
 async function setMirror(name, value, ttlMs, state) {
@@ -169,6 +257,72 @@ export async function lookupFirst(names, opts = {}) {
   return firstError ?? { missing: true };
 }
 
+/** Remove a socket/lockfile pair whose daemon is gone. A killed daemon leaves
+ *  the socket FILE behind, and a new daemon cannot bind to it — so an
+ *  auto-unlock that skips this fails with "socket already in use" and looks
+ *  exactly like a broken key file. `unlock` has always done this; the auto path
+ *  needs the same cleanup or it can never recover from a crash or reboot. */
+function clearStaleSocket() {
+  for (const f of [SOCKET, LOCKFILE]) {
+    try {
+      fs.unlinkSync(f);
+    } catch {}
+  }
+}
+
+/**
+ * Auto-start a permanent daemon if one is configured and the box is closed.
+ *
+ * This is what makes a permanent unlock survive a reboot without anyone typing
+ * a passphrase: the marker says "this store is allowed to open itself", the key
+ * file says with what. It is best-effort and deliberately loud on failure — a
+ * broken key file must never masquerade as "locked, just unlock it", and must
+ * not warn on every command forever, so a hard failure clears the marker.
+ *
+ * Returns an unlocked state or null. Never prompts, never touches providers.
+ */
+async function autoUnlockPermanent() {
+  const keyFile = readPermanentKey();
+  if (!keyFile) return null;
+  const read = readUnlockKeyFile(keyFile);
+  if (read.error) {
+    const errs = clearPermanentUnlock();
+    process.stderr.write(
+      `f: permanent unlock is unusable (${read.error}); removed the permanent-unlock marker.` +
+      `${errs.length ? ` Could not remove it: ${errs.join("; ")}` : ""}\n`
+    );
+    return null;
+  }
+  // No live daemon answered (that is why we are here), so anything on the socket
+  // path is a corpse from the previous daemon.
+  clearStaleSocket();
+  const result = await startDaemon(read.key, 0);
+  if (result.announcement?.ok) {
+    // A permanent daemon keeps this process' event loop alive: the pipes to it
+    // are open handles with no deadline, so a uck that merely read a cred would
+    // never exit. The daemon is detached and self-sustaining, so drop our end of
+    // the pipes; it keeps running and its own end stays writable.
+    for (const s of [result.child?.stdout, result.child?.stderr, result.child?.stdin]) {
+      try { s?.unref?.(); } catch {}
+    }
+    process.stderr.write("f: unlocked permanently (key file)\n");
+    return unlockedState();
+  }
+  // The key file no longer matches the box (restored backup? new store?). A
+  // permanent unlock that cannot open the store is not a permanent unlock.
+  const why = (result.stderr || "").trim().split("\n")[0] || result.announcement?.error || "daemon did not start";
+  const errs = clearPermanentUnlock();
+  process.stderr.write(
+    `f: permanent unlock failed (${why}); removed the permanent-unlock marker ` +
+    `so the store stays locked until you unlock it by hand.` +
+    `${errs.length ? ` Could not remove it: ${errs.join("; ")}` : ""}\n`
+  );
+  return null;
+}
+
+/** Ask for the permanent key file to be (re)created. Set when no key file
+ *  existed; refused by `f creds unlock <passkey>`, which is an explicit one-shot
+ *  unlock and must not silently install a permanent key. */
 function ensureFDir() {
   fs.mkdirSync(F, { recursive: true });
 }
@@ -194,9 +348,18 @@ function unlockedState() {
   const lf = readLockfile();
   if (!lf || !lf.pid || !pidAlive(lf.pid)) return null;
   const now = Date.now();
+  // A permanent daemon stores ttl: null and has no deadline at all; `lf.start`
+  // doubles as "when did this session begin" purely so `status` can show an age.
+  if (lf.permanent) return { remainingMs: now - (lf.start ?? now), socket: lf.socket, pid: lf.pid, permanent: true };
+  if (!Number.isFinite(lf.ttl)) {
+    // A lockfile with no usable ttl is not a countdown we can honour. Treating
+    // it as expired is the safe reading: it refuses service rather than serving
+    // forever, and the next `unlock` rewrites it correctly.
+    return null;
+  }
   const expires = lf.start + lf.ttl * 1000;
   if (now >= expires) return null; // expired (daemon will clean itself up)
-  return { remainingMs: expires - now, socket: lf.socket, pid: lf.pid };
+  return { remainingMs: expires - now, socket: lf.socket, pid: lf.pid, permanent: false };
 }
 
 /** Talk to the daemon over the socket. Returns the JSON response. */
@@ -332,80 +495,243 @@ function makeFillPrompt() {
   };
 }
 
-async function unlock(passkeyArg, ttl) {
-  ensureFDir();
-  // The file existing says nothing about the key it holds — a daemon started with
-  // a wrong passkey serves `ls` fine and fails later on every `get`. Probe it.
-  const live = await probeSocket(SOCKET);
-  if (live) {
-    process.stderr.write(`f: already unlocked (${fmt(live.remainingMs)} left)\n`);
-    return true;
-  }
-  // A socket file whose daemon is gone (or whose key is bad) must be cleared,
-  // or the next unlock would report instant false success.
-  if (fs.existsSync(SOCKET)) {
-    for (const f of [SOCKET, LOCKFILE]) {
-      try {
-        fs.unlinkSync(f);
-      } catch {}
-    }
-  }
-  const passkey = passkeyArg ?? (await promptPasskey());
-  if (!passkey) {
-    process.stderr.write("f: no passkey\n");
-    return false;
-  }
-  // Spawn daemon detached; passkey via stdin (not argv).
-  // Capture daemon stderr instead of discarding it, or a failed startup looks
-  // exactly like a successful one.
+/**
+ * Start the daemon. `ttl` of 0 means permanent (see daemon.js).
+ *
+ * The daemon, not the filesystem, is the authority on whether it came up: it
+ * announces {ok, ttl, permanent, error} on stdout before it can be detached.
+ * Watching for the socket file used to be the only signal, which could not tell
+ * "daemon refused the passkey" from "daemon is still starting", and could not
+ * see a ttl the daemon had rewritten (the `--permanent` request goes in as one
+ * flag and comes back as ttl=0).
+ */
+async function startDaemon(passkey, ttl) {
   let daemonErr = "";
-  const expiresAt = Date.now() + (ttl ?? DEFAULT_TTL) * 1000;
-  const child = spawn(process.execPath, [DAEMON, "--socket", SOCKET, "--lockfile", LOCKFILE, "--ttl", String(ttl ?? DEFAULT_TTL), "--creds", CREDS, "--expires-at", String(expiresAt)], {
+  const expiresAt = ttl ? Date.now() + ttl * 1000 : 0;
+  const child = spawn(process.execPath, [DAEMON, "--socket", SOCKET, "--lockfile", LOCKFILE, "--ttl", String(ttl), "--creds", CREDS, "--expires-at", String(expiresAt)], {
     detached: true,
     // Daemon stderr was `ignore`d, so the one message that matters — `wrong
     // passkey` — was thrown away, and the CLI fell through to `unlocked`.
-    stdio: ["pipe", "ignore", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
   child.stderr?.on("data", (c) => (daemonErr += c));
-  let daemonCode = null;
-  child.on("exit", (code) => (daemonCode = code));
-  child.stdin.on("error", () => {}); // EPIPE when the daemon exits before reading the passkey
-  child.stdin.write(passkey);
-  child.stdin.end();
-  child.unref();
-  // Wait briefly for the socket to come up.
-  const up = await waitForSocket(SOCKET, 2000);
-  if (up) return true;
 
-  // No socket: the daemon refused or died. Say why, in the operator's terms.
-  const why = daemonErr.trim().split("\n")[0] || "daemon did not start";
-  if (/wrong passkey/i.test(daemonErr)) {
+  const announcement = await new Promise((resolve) => {
+    let line = "";
+    let settled = false;
+    const finish = (v) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (c) => {
+      line += c;
+      const nl = line.indexOf("\n");
+      if (nl < 0) return;
+      try {
+        finish(JSON.parse(line.slice(0, nl)));
+      } catch {
+        finish(null);
+      }
+    });
+    child.on("error", (e) => {
+      daemonErr += `\n${e.message}`;
+      finish(null);
+    });
+    child.on("exit", () => finish(null));
+    child.stdin.on("error", () => {}); // EPIPE when the daemon exits before reading the passkey
+    child.stdin.write(passkey);
+    child.stdin.end();
+    // Cap the wait so a wedged daemon cannot hang the CLI forever.
+    setTimeout(() => finish(null), 15000).unref();
+  });
+
+  if (announcement?.ok) {
+    // Only detach once the daemon has proved it is serving. If we unref'd a
+    // daemon that then died, the parent would have nothing keeping its event
+    // loop alive and would exit before reading the failure.
+    child.unref();
+  } else {
+    try { child.kill("SIGKILL"); } catch {}
+  }
+  return { announcement, stderr: daemonErr, child };
+}
+
+/** Explain a failed start in the operator's terms. */
+function reportUnlockFailure({ announcement, stderr }) {
+  const why = (stderr || "").trim().split("\n")[0] || announcement?.error || "daemon did not start";
+  if (/wrong passkey/i.test(stderr || "")) {
     process.stderr.write(
       "f: wrong passkey — nothing was unlocked and nothing was written.\n" +
       "   The store is unchanged. If the passkey is genuinely lost, the entries\n" +
       "   are unrecoverable; restore a backup with: f creds restore <file>\n"
     );
-  } else if (daemonCode === 4) {
-    process.stderr.write(`f: ${why}\n`);
   } else {
     process.stderr.write(`f: could not unlock: ${why}\n`);
   }
-  return false;
 }
 
-function lock() {
+async function unlock(passkeyArg, ttl, opts = {}) {
+  ensureFDir();
+  // The file existing says nothing about the key it holds — a daemon started with
+  // a wrong passkey serves `ls` fine and fails later on every `get`. Probe it.
+  const live = await probeSocket(SOCKET);
+  if (live) {
+    process.stderr.write(`f: already unlocked (${fmt(live.remainingMs)}${live.permanent ? ", permanent" : ""} left)\n`);
+    return true;
+  }
+  // A socket file whose daemon is gone (or whose key is bad) must be cleared,
+  // or the next unlock would report instant false success.
+  if (fs.existsSync(SOCKET)) clearStaleSocket();
+
+  // A requested ttl overrides an existing key file; supplying a passkey by hand
+  // is an explicit, one-shot unlock and must not quietly become permanent.
+  let permanent = !!opts.permanent;
+  let keyFile = opts.keyFile ?? null;
+  if (!permanent && !passkeyArg && !opts.keyFile && ttl === undefined) {
+    const configured = readPermanentKey();
+    if (configured) {
+      permanent = true;
+      keyFile = configured;
+    }
+  }
+
+  let keyFromFile = null;
+  if (permanent && !passkeyArg) {
+    const target = keyFile ?? UNLOCKKEY;
+    if (!fs.existsSync(target)) {
+      if (!opts.createKey) {
+        process.stderr.write(
+          `f: no unlock key at ${target}. Create one with:\n` +
+          `   f creds unlock --permanent   (writes the key, then unlocks)\n`
+        );
+        return false;
+      }
+      // Generate, then read back through the same permission-checked path so the
+      // file we unlock with is the file we just verified is 0600 and non-empty.
+      const created = createUnlockKey(target, opts.keyLabel ?? "f creds permanent unlock key");
+      if (created.error) {
+        process.stderr.write(`f: ${created.error}\n`);
+        return false;
+      }
+      process.stderr.write(`f: wrote unlock key ${target} (0600)\n`);
+    }
+    const read = readUnlockKeyFile(target);
+    if (read.error) {
+      process.stderr.write(`f: ${read.error}\n`);
+      return false;
+    }
+    keyFromFile = read;
+  }
+
+  const passkey = passkeyArg ?? keyFromFile?.key ?? (await promptPasskey());
+  if (!passkey) {
+    process.stderr.write("f: no passkey\n");
+    return false;
+  }
+  const effectiveTtl = permanent ? 0 : (ttl ?? DEFAULT_TTL);
+  const result = await startDaemon(passkey, effectiveTtl);
+  if (!result.announcement?.ok) {
+    reportUnlockFailure(result);
+    return false;
+  }
+
+  // Trust the daemon's own ttl: `--permanent` is a request, ttl 0 is the fact.
+  permanent = !!result.announcement.permanent;
+  if (permanent) {
+    writePermanentMarker(keyFromFile?.file ?? UNLOCKKEY, {
+      source: passkeyArg ? "argument" : "key-file",
+    });
+    process.stderr.write("f: unlocked permanently (no expiry). Revert with: f creds lock\n");
+  }
+  return true;
+}
+
+/** Create the unlock key file with a tight mode. The value is random, so
+ *  writing it through a descriptor is fine — it is never a user passphrase. */
+function createUnlockKey(file, label) {
+  try {
+    const fd = fs.openSync(file, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, crypto.randomBytes(32).toString("hex") + "\n");
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.chmodSync(file, 0o600);
+    return { file };
+  } catch (e) {
+    if (e.code === "EEXIST") {
+      return { error: `${file} already exists — refusing to overwrite an existing unlock key` };
+    }
+    return { error: `could not create ${file}: ${e.message}` };
+  }
+}
+
+function writePermanentMarker(keyFile, extra = {}) {
+  try {
+    fs.writeFileSync(UNLOCKMARK, JSON.stringify({ keyFile, since: Date.now(), ...extra }, null, 2), { mode: 0o600 });
+    try { fs.chmodSync(UNLOCKMARK, 0o600); } catch {}
+    return true;
+  } catch (e) {
+    // The daemon is unlocked either way; a missing marker only costs auto-restart
+    // after a crash, so say so rather than failing an unlock that worked.
+    process.stderr.write(`f: unlocked, but could not write ${UNLOCKMARK}: ${e.message}\n`);
+    return false;
+  }
+}
+
+/**
+ * Stop the daemon and zeroize the key. For a permanently-unlocked store this
+ * also clears the auto-unlock marker: otherwise the very next `f creds get`
+ * would start a new daemon from the key file and the operator's `lock` would
+ * appear to have done nothing. The key file itself survives (it is a secret you
+ * may want to keep) unless --purge asks for its deletion.
+ */
+function lock(opts = {}) {
   const lf = readLockfile();
+  const hadMarker = !!readPermanentKey();
+  const keyPath = readPermanentKey() ?? UNLOCKKEY;
+  const errs = clearPermanentUnlock({ removeKey: !!opts.purge });
+  // Read the paths BEFORE clearing them: a message that reports what it deleted
+  // must not print `undefined` for the file it just removed.
+  const describe = (verb) =>
+    verb +
+    (hadMarker ? " and removed the permanent-unlock marker" : "") +
+    (opts.purge ? ` and deleted ${keyPath}` : "") +
+    (errs.length ? ` (${errs.join("; ")})` : "") +
+    "\n";
   if (!lf || !pidAlive(lf.pid)) {
-    process.stderr.write("f: not unlocked\n");
-    for (const f of [SOCKET, LOCKFILE]) try { fs.unlinkSync(f); } catch {}
+    if (hadMarker) {
+      // The marker is the only thing that makes this store auto-openable, so
+      // removing it is the meaningful outcome even with no daemon to signal.
+      process.stderr.write(describe("f: no daemon was running; removed the permanent-unlock marker"));
+    } else {
+      process.stderr.write("f: not unlocked\n");
+      for (const f of [SOCKET, LOCKFILE]) try { fs.unlinkSync(f); } catch {}
+    }
     return;
   }
   process.kill(lf.pid, "SIGTERM");
-  process.stderr.write("f: locked\n");
+  process.stderr.write(describe("f: locked"));
+}
+
+/**
+ * State for the programmatic API. A configured permanent unlock may open itself
+ * here; an unconfigured one must NEVER prompt, because a uck in a pipeline is
+ * not a human at a terminal. Still returns null when locked — `CredsError.locked`
+ * is how sibling ucks decide to ask for `f creds fill`.
+ */
+async function apiState() {
+  const state = unlockedState();
+  if (state) return state;
+  return autoUnlockPermanent();
 }
 
 async function requireUnlocked() {
-  const state = unlockedState();
+  let state = unlockedState();
+  if (!state) state = await autoUnlockPermanent();
   if (!state) {
     process.stderr.write("f: creds locked. Run `f creds unlock`\n");
     process.exit(1);
@@ -729,9 +1055,13 @@ function clearWaiter(name) {
  */
 async function wait(name, { timeout = 300000, pollMs = 500, onPoll, by } = {}) {
   const deadline = Date.now() + timeout;
-  // Helper: does the cred exist right now (daemon must be up)?
+  // Helper: does the cred exist right now? A permanent unlock is allowed to
+  // start its own daemon here — a waiter that refused to wake a permanently
+  // unlocked store would block for its whole timeout on a store that can open
+  // itself. Anything else stays locked and keeps waiting for a human.
   async function tryGet() {
-    const state = unlockedState();
+    let state = unlockedState();
+    if (!state) state = await autoUnlockPermanent();
     if (!state) return null; // locked
     const r = await daemonCall({ op: "get", name }, state.socket);
     if (r && r.ok && r.value != null && r.value !== "") return r.value;
@@ -816,10 +1146,12 @@ export function register(ctx) {
     registerProvider,
     // Programmatic entry for other ucks. version: peers feature-detect on this
     // (>=1: CredsError with .kind is thrown; message text is NOT an API).
+    // v2: `lock` takes { purge }, `unlock` takes a third options argument, and a
+    // configured permanent unlock starts its own daemon on get/set/ls/resolve.
     credsApi: {
-      version: 1,
+      version: 2,
       async get(name, ttl) {
-        const state = unlockedState();
+        const state = await apiState();
         if (!state) throw CredsError.locked();
         const r = await daemonCall({ op: "get", name }, state.socket);
         if (r.ok && r.value != null && r.value !== "") return r.value;
@@ -837,12 +1169,12 @@ export function register(ctx) {
         throw toCredsError(name, new Error(r.error ?? `no such cred: ${name}`));
       },
       async set(name, value) {
-        const state = unlockedState();
+        const state = await apiState();
         if (!state) throw CredsError.locked();
         await daemonCall({ op: "set", name, value }, state.socket);
       },
       async ls() {
-        const state = unlockedState();
+        const state = await apiState();
         if (!state) throw CredsError.locked();
         const r = await daemonCall({ op: "ls" }, state.socket);
         return r.names ?? [];
@@ -866,8 +1198,13 @@ export function register(ctx) {
           by: m.by ?? "unknown",
         }));
       },
+      /** Ask for a permanent, file-backed unlock. Options:
+       *    { permanent, keyFile, createKey, keyLabel }
+       *  `f creds unlock --permanent` = { permanent: true, createKey: true }. */
       unlock,
       lock,
+      /** Is a permanent unlock configured? Read-only; starts nothing. */
+      permanentUnlock: () => readPermanentKey(),
       /** Programmatic resolution that includes provider-backed creds. See the
        *  lookupCred() doc comment for why `f ha`/`f gh` needed this. */
       lookupCred,
@@ -877,7 +1214,7 @@ export function register(ctx) {
        *  { value, source, warning? } or throws. Use this from a uck that needs
        *  to report where a token came from. */
       async resolve(name, opts = {}) {
-        const state = unlockedState();
+        const state = await apiState();
         if (!state) throw CredsError.locked();
         if (opts.noCache) clearMisses(name);
         if (!opts.localOnly && !opts.forceProvider) {
@@ -911,12 +1248,23 @@ export function register(ctx) {
       },
       status: () => {
         const s = unlockedState();
-        return s ? { unlocked: true, remainingMs: s.remainingMs } : { unlocked: false };
+        return s
+          ? { unlocked: true, remainingMs: s.remainingMs, permanent: !!s.permanent }
+          : { unlocked: false };
       },
+      /** Human-readable unlock line, so a uck's status output cannot drift from
+       *  what `f creds status` says about a permanent session. */
+      describeStatus: () => describeUnlock(unlockedState()),
     },
     run: (argv, args) => {
       const pos = [];
-      let ttl = DEFAULT_TTL;
+      // undefined = "the operator did not ask for a ttl". It used to be
+      // initialised to DEFAULT_TTL here, which made every downstream
+      // `ttl !== undefined` test permanently true — so "an explicit --ttl was
+      // given" and "--permanent conflicts with --ttl" were both always true,
+      // and `f creds unlock --permanent` refused to run at all. unlock() still
+      // applies DEFAULT_TTL itself.
+      let ttl;
       let timeoutSec = 300; // default wait window for `request`
       let showSecrets = false;
       const unknownFlags = [];
@@ -934,10 +1282,22 @@ export function register(ctx) {
       let lookupFd = null;        // --fd N[wa]: write the raw value to inherited fd N
       let noCache = false;        // --no-cache: ignore + clear the negative cache
       let showAll = false;        // --all (ls): include provider mirrors
+      let permanent = false;      // --permanent: no expiry, key read from a file
+      let keyFileOpt = null;      // --key-file <path>: where that key lives
+      let purge = false;          // --purge (lock): delete the key file too
+      let ttlRequested = null;    // raw --ttl argument, to reject `--ttl 0`
       const a = [...(args._ ?? [])];
       for (let i = 0; i < a.length; i++) {
         if (a[i] === "--ttl") {
-          ttl = parseDurationSec(a[++i], "--ttl");
+          ttlRequested = a[++i];
+          ttl = parseDurationSec(ttlRequested, "--ttl");
+        } else if (a[i] === "--permanent") {
+          permanent = true;
+        } else if (a[i] === "--key-file") {
+          keyFileOpt = a[++i];
+          if (!keyFileOpt) throw new Error("--key-file needs a path");
+        } else if (a[i] === "--purge") {
+          purge = true;
         } else if (a[i] === "--timeout") {
           timeoutSec = parseDurationSec(a[++i], "--timeout");
         } else if (a[i] === "--secrets") {
@@ -1005,16 +1365,44 @@ export function register(ctx) {
             if (rest.length > 1) {
               return usage(`unlock takes at most one passkey argument, got ${rest.length}: ${rest.join(" ")}`);
             }
+            if (ttl !== undefined && permanent) {
+              return usage("--ttl and --permanent are mutually exclusive (--permanent means no expiry)");
+            }
+            if (ttlRequested !== null && /^0+$/.test(String(ttlRequested).trim())) {
+              // `--ttl 0` would reach the daemon as "permanent" through the back
+              // door: no key file, no marker, no warning. Say what to type.
+              return usage("--ttl 0 is not a duration; use --permanent for an unlock that never expires");
+            }
+            if (rest.length && permanent) {
+              return usage(
+                "--permanent does not take a passkey argument — the point is that the key comes from " +
+                "a file. Store the passkey first, then unlock:\n" +
+                `    umask 077 && printf '%s' 'YOUR-PASSKEY' > ${UNLOCKKEY}\n` +
+                "    f creds unlock --permanent"
+              );
+            }
+            if (keyFileOpt !== null && !permanent) {
+              return usage("--key-file only applies to --permanent");
+            }
+            if (purge) {
+              return usage("--purge only applies to `f creds lock`");
+            }
             // Honour the result: unlock() now returns false when the daemon
             // refused the passkey, and a failed unlock must not exit 0 — a
             // script that did `f creds unlock && deploy` would otherwise deploy.
-            process.exit((await unlock(rest[0], ttl)) ? 0 : 4);
+            process.exit((await unlock(rest[0], ttl, {
+              permanent,
+              keyFile: keyFileOpt,
+              // No key file yet means the operator is setting this up, so write
+              // one. An explicit passkey is the exception (see above).
+              createKey: permanent,
+            })) ? 0 : 4);
           case "lock":
-            lock();
+            lock({ purge });
             break;
           case "status": {
             const s = unlockedState();
-            process.stdout.write(s ? `unlocked (${fmt(s.remainingMs)} left)\n` : "locked\n");
+            process.stdout.write(describeUnlock(s) + "\n");
             // Providers are part of the answer now: a missing cred may be living
             // in a vault the local store has never seen.
             try {
@@ -1563,7 +1951,7 @@ async function probeSocket(socketPath) {
   if (!lf?.pid || !pidAlive(lf.pid)) return null;
   try {
     const r = await Promise.race([
-      daemonCall({ op: "ls" }, socketPath),
+      daemonCall({ op: "ping" }, socketPath),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error("timeout")), 1500)
       ),
@@ -1574,25 +1962,12 @@ async function probeSocket(socketPath) {
   }
 }
 
-// Resolves true only if the socket appeared, false on daemon death or timeout.
-// (The previous version resolved undefined either way, hiding every failure.)
-function waitForSocket(p, ms) {
-  const start = Date.now();
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (v) => {
-      if (done) return;
-      done = true;
-      resolve(v);
-    };
-    const try_ = () => {
-      if (fs.existsSync(p)) return resolve(true);
-      if (Date.now() - start > ms) return resolve(false);
-      setTimeout(try_, 50);
-    };
-    try_();
-  });
-}
+// Removed: waitForSocket(). It polled for the socket FILE, which cannot
+// distinguish "daemon refused the passkey" from "daemon is still starting", and
+// it let `unlock` unref a detached child that then died — so the parent had
+// nothing keeping its event loop alive and exited 0 on a failed unlock. The
+// daemon now announces {ok, ttl, permanent, error} on stdout and startDaemon()
+// waits for that instead.
 
 function usage(msg) {
   const line = msg ? `f: ${msg}\n` : "";
@@ -1601,7 +1976,15 @@ function usage(msg) {
       "usage: f creds <cmd>\n" +
       "  unlock [passkey] [--ttl sec]   start daemon; --ttl accepts s/m/h/d/w\n" +
       "                                    (e.g. 900, 45m, 2h, 1d, 1d6h30m; default 10m)\n" +
-      "  lock                            stop daemon, zeroize key\n" +
+      "  unlock --permanent [--key-file p]\n" +
+      "                                permanent file-based unlock: no expiry, passkey\n" +
+      "                                    read from a 0600 key file (default\n" +
+      "                                    ~/.f/.creds-unlock.key, created if missing)\n" +
+      "                                    and the daemon restarts itself on the next\n" +
+      "                                    creds command after a reboot or crash\n" +
+      "  lock [--purge]                 stop daemon, zeroize key; also removes the\n" +
+      "                                    permanent-unlock marker (--purge deletes the\n" +
+      "                                    key file too)\n" +
       "  status                          locked / unlocked + time left, + provider readiness\n" +
       "  set <name> [value|-]           store a cred (also clears that name's mirror);\n" +
       "                                    no value (or `-`) reads stdin, and a TTY\n" +

@@ -436,14 +436,24 @@ Two exist today:
 
 ```js
 creds.credsApi = {
-  version?: 1,                  // §7.2: gates whether `kind` is guaranteed
+  version?: 2,                  // §7.2: gates whether `kind` is guaranteed
   get(name, ttl?),              // → value; throws CredsError (G5) or Error
   set(name, value),
   ls(),                         // → [names]
   wait(name, opts?),            // block up to timeout (default 5 min)
+  unlock(passkey?, ttl?, { permanent, keyFile, createKey, keyLabel }),
+  lock({ purge }),
+  permanentUnlock(),            // → key-file path | null; read-only, starts nothing
+  describeStatus(),             // → the same unlock line `f creds status` prints
   // … plus request/waiters helpers
 }
 ```
+
+Version 2 adds the permanent file-based unlock and changes one behaviour peers
+can observe: `get`/`set`/`ls`/`resolve` will start a daemon *themselves* when a
+permanent unlock is configured (`~/.f/.creds-unlock` + its key file). A locked
+store with no permanent unlock still throws `kind: "locked"` exactly as before —
+nothing in v2 prompts, and nothing in v2 does provider traffic while locked.
 
 - **C1.** `get` runs the full provider ladder (local box, then providers,
   mirroring). While locked it throws — callers must treat *locked* and
@@ -460,10 +470,16 @@ creds.credsApi = {
   report locked/missing in its own status output.
 - **C4. The creds socket protocol** (`~/.f/.creds.sock`, one JSON object per
   request, one JSON reply). Ops: `get` (value, or base64 with `b64: true`),
-  `set` (value, optional `expiresAt` for mirrors), `has`, `ls`, `meta`, `rm`.
-  Replies: `{ ok: true, value? }` or `{ ok: false, error }`. The lockfile is
-  `~/.f/.creds-daemon` (`{ pid, start, ttl, socket }`); peers read it directly
-  for a non-blocking locked/unlocked check. Shared helpers: `fcli-ucks/lib/creds-error.js`
+  `set` (value, optional `expiresAt` for mirrors), `has`, `ls`, `meta`, `rm`,
+  `ping` (liveness only — replies `{ok, permanent}` and decrypts nothing, so it
+  stays fast on a large box and cannot time out a probe into starting a second
+  daemon). Replies: `{ ok: true, value? }` or `{ ok: false, error }`. The
+  lockfile is `~/.f/.creds-daemon` (`{ pid, start, ttl, socket, permanent }`);
+  peers read it directly for a non-blocking locked/unlocked check. **`ttl` is
+  `null` when `permanent` is true** — a peer computing `start + ttl*1000` must
+  treat `permanent: true` as "no deadline" and a non-finite `ttl` as expired
+  (refuse service), never as "never expires". Shared helpers:
+  `fcli-ucks/lib/creds-error.js`
   (`classifyCredsError`) and the personal bucket's `lib/credsresolve.js`
   (`resolveCred`). Both are **duplicated per bucket by design** (N4/P7), and
   both must translate into the §7.2 vocabulary — their private reason codes are

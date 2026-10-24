@@ -26,7 +26,8 @@ services, no external binaries.
 | `get <name> [--secrets]` | print a cred — **redacted without `--secrets`** |
 | `ls` / `has <name>` / `rm <name>` | list / test existence / delete |
 | `meta <name>` | existence + size + bytes without decrypting the value |
-| `unlock [--ttl <dur>]` / `lock` | open or zeroise the in-memory key |
+| `unlock [--ttl <dur>]` / `lock [--purge]` | open or zeroise the in-memory key |
+| `unlock --permanent [--key-file <p>]` | never-expiring unlock driven by a 0600 key file; restarts itself after a reboot |
 | `status` | locked/unlocked, time left, providers and their readiness |
 | `import <file>` / `export` | move entries between stores |
 | `files pack/unpack/list` | whole files in the same box (`file:<abs path>`) |
@@ -46,6 +47,38 @@ services, no external binaries.
 
 There is **no** `--provider`, `--no-provider`, or `--clear-misses`. `--vault` / `--local`
 are the provider on/off pair, and `--no-cache` is the miss-cache reset.
+
+---
+
+## Unlock modes
+
+| | how the key arrives | lifetime | after a reboot |
+|---|---|---|---|
+| **TTL** (default) | prompt, or one argument | `--ttl`, default 10m | prompt again |
+| **Permanent** (`--permanent`) | 0600 key file | none | restarts itself on the next creds command |
+
+```bash
+# one-time, on a brand-new store
+f creds unlock --permanent
+
+# one-time, on an existing passphrase store — --permanent will not guess your key
+umask 077 && printf '%s' 'YOUR-PASSKEY' > ~/.f/.creds-unlock.key
+f creds unlock --permanent
+```
+
+The permanent mode is exactly two files under `~/.f`: `.creds-unlock.key` (the
+passkey) and `.creds-unlock` (a marker saying "this store may open itself"). Any
+creds command that finds the box closed and the marker present starts a new
+permanent daemon, which is what makes it survive restarts with no setup — no
+systemd unit, no cron `@reboot`, no resident process to babysit.
+
+What it is not: it is not a passphrase-less *secure* mode. The key file is the
+credential, readable by any process running as your uid and by root — the same
+threat model as an SSH private key on disk. `f creds lock` removes the marker so
+`lock` means what it says, and `--purge` deletes the key file as well. A key file
+that is group/world-readable, or that no longer opens the box, degrades to
+`locked` and clears the marker; it never falls back to a prompt or to provider
+traffic, because a locked store must stay locked.
 
 ---
 

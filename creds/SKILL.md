@@ -15,7 +15,11 @@ Encrypted credential store (scrypt+AES-GCM). A local daemon holds the key in mem
 ```
 f creds unlock [passkey] [--ttl d]      start daemon; --ttl accepts s/m/h/d/w
                                         (900, 45m, 2h, 1d, 1d6h30m; default 10m)
-f creds lock                            stop daemon, zeroize key
+f creds unlock --permanent [--key-file p]
+                                        permanent file-based unlock (see below)
+f creds lock [--purge]                  stop daemon, zeroize key; also removes the
+                                        permanent-unlock marker (--purge deletes
+                                        the key file too)
 f creds status                          locked / unlocked + time left
 f creds set <name> [<value>|-]          store a cred; no value reads stdin
                                         (pipe it, or type it at a TTY — no echo)
@@ -26,6 +30,54 @@ f creds fill [name]                     prompt + set value(s) for open waiters
 f creds ls                              list names
 f creds rm <name>                       remove a cred
 ```
+
+## Permanent file-based unlock (`--permanent`)
+
+For a box you want open all the time — a workstation you log into, a homelab
+host — `--permanent` removes both the passphrase prompt and the expiry:
+
+```
+f creds unlock --permanent              writes ~/.f/.creds-unlock.key (0600) if
+                                        missing, then unlocks with no expiry
+f creds status
+unlocked (permanent, since 3m 2s, key file: ~/.f/.creds-unlock.key)
+f creds lock                            stop + stop auto-restarting
+f creds lock --purge                    also delete the key file
+```
+
+Two files, both under `~/.f`: the **key file** holds the passkey, and the
+**marker** (`.creds-unlock`) records the intent. While the marker exists, any
+creds command that finds the box closed starts a fresh permanent daemon from the
+key file itself — so a reboot, an OOM kill or a `kill -9` needs no human:
+
+```
+f creds status
+locked
+f creds get github.com --secrets
+f: unlocked permanently (key file)
+ghp_...
+```
+
+Know what this costs, because it is a deliberate weakening of the store:
+
+- **The key file is the credential.** Anyone who can read it — any process as
+  your uid, and root — can open the box. This is the security level of an SSH
+  private key sitting on disk, not of a passphrase. It is *not* leaked by a
+  running daemon, but a config-management tool that copies `~/.f` copies it.
+- **`--permanent` never invents a key for an existing store.** A randomly
+  generated passkey cannot open a box keyed by yours, so on an existing store
+  you must seed the file yourself:
+  `umask 077 && printf '%s' 'YOUR-PASSKEY' > ~/.f/.creds-unlock.key && f creds unlock --permanent`
+  Generation only applies to a brand-new box.
+- **A group/world-readable key file is refused**, and a key file that no longer
+  opens the box **clears the marker** rather than warning on every command
+  forever. Either way the answer is `locked`, never a prompt and never provider
+  traffic.
+- **`lock` removes the marker.** If it didn't, the next `f creds get` would open
+  the box again and "locked" would be a lie. The key file survives unless you
+  pass `--purge`.
+- `--ttl` and `--permanent` are mutually exclusive, and `--ttl 0` is rejected
+  rather than quietly meaning "permanent".
 
 ## Providers (looking a secret up elsewhere)
 
