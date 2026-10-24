@@ -2,7 +2,7 @@
 
 All notable changes to the default uck bundle.
 
-## [Unreleased]
+## [0.4.1]
 
 ### Added
 - **`creds`: `credsApi` is now the single interface into the store**
