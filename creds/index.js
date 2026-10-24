@@ -1040,6 +1040,313 @@ function clearWaiter(name) {
   if (name in w) { delete w[name]; writeWaiters(w); }
 }
 
+/** Candidate cred names for a base URL: `host:port` first, then the bare host.
+ *  Exported so a uck keyed on an instance URL does not re-implement host parsing
+ *  (every copy of that parsing in this tree drifted). */
+export function credNamesFor(base) {
+  if (!base) return [];
+  let host;
+  try {
+    host = new URL(base).host || null;
+  } catch {
+    host = String(base).replace(/^https?:\/\//, "").replace(/^ssh:\/\/@?/, "").split("/")[0] || null;
+  }
+  if (!host) return [];
+  return host.includes(":") ? [host, host.split(":")[0]] : [host];
+}
+
+/**
+ * The single entry point for a uck that needs a credential (CONTRACT.md §6.1).
+ *
+ * Every uck used to roll this itself: read `~/.f/.creds-daemon`, decide
+ * locked/unlocked from the raw lockfile, then maybe call credsApi. That put a
+ * copy of creds' internal state machine in six other modules, and the copies
+ * drifted — when `f creds unlock --permanent` started writing `{ttl: null,
+ * permanent: true}`, all of them tested `!lf.ttl` or computed
+ * `start + ttl*1000`, concluded "expired at t=0", and reported `creds are
+ * locked` for a box that `f creds status` called `unlocked (permanent)`. A
+ * permanent session has no deadline; `start` is only its age. Only this module
+ * gets to decide what "unlocked" means, because only this module can also act
+ * on it: apiState() revives a configured permanent daemon after a reboot/OOM
+ * kill, which a file read cannot do.
+ *
+ * So: ask, don't peek. `resolveCred` is one call that answers the whole
+ * question, and its `reason` is a CONTRACT.md §7.2 kind, not a private word.
+ *
+ *   resolveCred({ names: ["forgejo.kensand.net"] })
+ *   resolveCred({ host: "https://forgejo.kensand.net" })   // names derived
+ *   resolveCred({ names, flagToken, envVars: { FORGEJO_TOKEN: process.env.FORGEJO_TOKEN }, waitMs })
+ *
+ * -> { token, src }                             success
+ * -> { token: null, reason, host?, detail? }    failure, reason ∈ the five kinds:
+ *      locked    store closed, no permanent unlock -> `f creds unlock`
+ *      missing   open box, no local value, no provider hit -> `f creds set <name> <v>`
+ *      provider  a provider was reached and failed; `detail` is its message
+ *      no-store  credsApi absent and the socket unreachable — NOT "not configured"
+ *      timeout   `waitMs` elapsed without a value
+ *
+ * Rules: never prompts, never prints, never does provider traffic while locked,
+ * and never blocks unless `waitMs` is given. `flagToken`/`envVars` win before
+ * any creds call so an explicit credential costs no daemon round trip.
+ */
+export async function resolveCred(opts = {}) {
+  const { names, host, flagToken, envVars = {}, waitMs = 0, timeoutMs = 30000, raw = false } = opts;
+  if (typeof flagToken === "string" && flagToken) return { token: flagToken, src: "--token" };
+  for (const [env, val] of Object.entries(envVars)) {
+    if (val) return { token: val, src: env };
+  }
+
+  let list = (Array.isArray(names) ? names : names ? [names] : []).filter(Boolean);
+  if (!list.length && host) list = credNamesFor(typeof host === "string" ? host : host?.base);
+  if (!list.length) throw new Error("resolveCred: pass { names } or { host } \u2014 nothing to look up");
+
+  const probeName = list[0];
+  // A permanent unlock may restart its own daemon, and that is not "blocking":
+  // one spawn, no prompt, no provider traffic. So the store is opened FIRST even
+  // under --wait \u2014 `--wait` on a permanently unlocked box means "wait for the
+  // value", not "block for 300s on a store that can open itself" (creds' own
+  // waiter has always applied this rule; a uck that peeks at the lockfile cannot).
+  let state = await apiState();
+  if (!state && !waitMs) return { token: null, reason: "locked", host: probeName };
+
+  let providerError = null;
+  const attempt = async () => {
+    for (const name of list) {
+      try {
+        const r = await withDeadline(
+          raw ? rawLookup(name, state) : lookupCred(name, {}),
+          timeoutMs,
+          `creds lookup '${name}'`,
+        );
+        if (r?.value != null && (Buffer.isBuffer(r.value) ? r.value.length : r.value !== "")) {
+          return { token: r.value, src: r.source ? `${name} via ${r.source}` : `creds:${name}`, source: r.source, warning: r.warning };
+        }
+        if (r?.error) providerError = { host: name, detail: r.error };
+        else if (r?.locked) return { token: null, reason: "locked", host: name };
+      } catch (e) {
+        const kind = classifyThrown(e);
+        if (kind === "locked") return { token: null, reason: "locked", host: name };
+        if (kind === "provider") providerError = { host: name, detail: e?.message ?? String(e) };
+        /* missing / timeout: try the next candidate name */
+      }
+    }
+    return null;
+  };
+
+  // Open box: one pass, no waiting. `--wait` exists to wait for a value that a
+  // human is about to set, so it must not short-circuit just because the box is
+  // already open \u2014 that made `f fj --wait` answer `missing` in 0ms instead of
+  // blocking for the cred, while a *locked* box waited correctly. Same command,
+  // two behaviours, neither explainable from the outside.
+  if (!waitMs) {
+    const hit = await attempt();
+    if (hit) return hit;
+    if (providerError) return { token: null, reason: "provider", ...providerError };
+    return { token: null, reason: "missing", host: probeName };
+  }
+
+  // Blocking path. wait() registers the waiter BEFORE polling, so `f creds
+  // waiters`/`fill` in another terminal can see and answer the request.
+  const deadline = Date.now() + waitMs;
+  let lastErr = null;
+  for (const name of list) {
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    try {
+      const v = await wait(name, { timeout: left });
+      if (v != null && v !== "") return { token: v, src: `creds:${name} (waited)` };
+    } catch (e) {
+      lastErr = e;
+    }
+    // A waiter only polls the local box. Re-run the full ladder here so a
+    // provider-backed (vault) cred is reachable by a uck that asked to wait \u2014
+    // otherwise --wait would time out on a credential `f creds get` returns
+    // instantly.
+    state = (await apiState()) || state;
+    if (state) {
+      const hit = await attempt();
+      if (hit) return hit;
+      if (providerError) return { token: null, reason: "provider", ...providerError };
+    }
+    if (Date.now() >= deadline) break;
+  }
+  if (providerError) return { token: null, reason: "provider", ...providerError };
+  if (lastErr?.kind === "locked") return { token: null, reason: "locked", host: probeName, detail: lastErr.message };
+  return {
+    token: null,
+    reason: "timeout",
+    host: probeName,
+    detail: lastErr?.message ?? `timed out after ${waitMs}ms waiting for '${probeName}'`,
+  };
+}
+
+/** Byte-exact twin of lookupCred for a caller that must not lose bytes.
+ *  `f ssh` needs it: a PEM without its trailing newline is rejected by
+ *  `ssh-add -`, and the string path utf8-decodes (and the daemon trims) on the
+ *  way out. Order matches lookupCred: local entry, then the provider ladder —
+ *  a vault-backed key exists only as `mirror:<name>`, so a raw socket read of
+ *  the plain name misses it and the uck concludes "no key stored". */
+async function rawLookup(name, state) {
+  const r = await daemonCall({ op: "get", name, b64: true }, state.socket);
+  if (r.ok && (r.b64 != null || r.value != null)) {
+    const buf = r.b64 != null ? Buffer.from(r.b64, "base64") : Buffer.from(String(r.value), "utf8");
+    if (buf.length) return { value: buf, source: isMirrorKey(name) ? `mirror (${name.slice(MIRROR_PREFIX.length)})` : `local:${name}` };
+  }
+  // Provider ladder, then the raw mirror key — same ladder as the string path,
+  // so a hit is byte-exact regardless of which layer served it.
+  const res = await resolveViaProvider(name, {
+    getCred: (k) => rawGet(k, state),
+    setMirror: (k, v, t) => setMirror(k, v, t, state),
+    isFresh: (n, t) => isMirrorFresh(n, t),
+  });
+  if (res.value != null) {
+    const buf = Buffer.isBuffer(res.value) ? res.value : Buffer.from(String(res.value), "utf8");
+    return { value: buf, source: res.mirror ? `mirror (${res.mirror})` : `${res.provider}:${name}`, warning: res.warning };
+  }
+  if (res.error) return { error: `provider '${res.provider}' failed: ${res.error}` };
+  const mirrored = await daemonCall({ op: "get", name: MIRROR_PREFIX + name, b64: true }, state.socket);
+  if (mirrored.ok && (mirrored.b64 != null || mirrored.value)) {
+    const buf = mirrored.b64 != null ? Buffer.from(mirrored.b64, "base64") : Buffer.from(String(mirrored.value), "utf8");
+    if (buf.length) return { value: buf, source: "mirror (unverified)", stale: true };
+  }
+  return { missing: true };
+}
+
+/** Last resort for a process with no creds uck in its registry (CONTRACT.md C3).
+ *  Reports `no-store` when the socket cannot be reached, which is an
+ *  availability failure and NOT the same as "you never configured this". */
+async function rawCredRead(names, timeoutMs = 3000, raw = false) {
+  // apiState(), NOT unlockedState(): the whole point of the permanent unlock is
+  // that a configured store restarts itself, and this is the entry point a
+  // process without a creds uck falls back to. Using the bare state read made
+  // `f fj` report `creds are locked` on a permanently unlocked box for the
+  // original reason all over again — same root cause, one layer down.
+  let st;
+  try {
+    st = await apiState();
+  } catch {
+    return { token: null, reason: "no-store" };
+  }
+  if (!st) return { token: null, reason: "locked" };
+  let got = null;
+  for (const name of names) {
+    try {
+      const req = raw ? { op: "get", name, b64: true } : { op: "get", name };
+      const r = await Promise.race([
+        daemonCall(req, st.socket),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
+      ]);
+      const val = r?.b64 != null ? Buffer.from(r.b64, "base64") : r?.value;
+      if (r?.ok && val != null && (Buffer.isBuffer(val) ? val.length : val !== "")) { got = val; break; }
+    } catch {
+      return { token: null, reason: "no-store" };
+    }
+  }
+  // A raw socket read sees only local entries: no provider ladder, no mirrors
+  // under their plain name. Say so, or a vault-backed cred looks unconfigured.
+  return got != null
+    ? { token: got, src: `socket:${names[0]} (local only)`, localOnly: true }
+    : { token: null, reason: "missing", host: names[0], localOnly: true };
+}
+
+/** wait() across several candidate names: first value wins, one deadline total. */
+async function waitCredWith(list, waitMs, pollBudgetMs = 5000) {
+  // The caller's patience is `waitMs`. `timeoutMs` bounds a *single read* against
+  // a daemon that may be wedged; letting it bound the whole wait turned
+  // `--wait 4` into a 30s hang, which is the exact failure shape this whole
+  // resolver exists to remove.
+  const deadline = Date.now() + waitMs;
+  let lastErr = null;
+  for (const name of list) {
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    try {
+      const v = await wait(name, { timeout: Math.min(left, pollBudgetMs) });
+      if (v != null && v !== "") return { token: v, src: `creds:${name} (waited)` };
+    } catch (e) {
+      lastErr = e;
+    }
+    if (Date.now() >= deadline) break;
+  }
+  if (lastErr?.kind === "locked") throw lastErr;
+  throw Object.assign(new Error(lastErr?.message ?? `timed out after ${waitMs}ms waiting for a credential`), { kind: "timeout" });
+}
+
+/** Thrown value -> §7.2 kind, and the mapping is TOTAL: every throw from every
+ *  creds entry point lands on exactly one kind. Structural first
+ *  (CredsError.kind, version >= 1); message matching is only the pre-v1
+ *  fallback, never the primary test.
+ *
+ *  The `timeout` default is what makes it total, and it is load-bearing rather
+ *  than a dump: wait() and the deadline race throw plain Errors carrying no
+ *  kind, and a bare Error with the word "locked" inside it ("timed out waiting
+ *  for cred 'x' — run: f creds unlock …") is a TIMEOUT, not a lock. Getting
+ *  this backwards makes `--wait` tell the user to unlock a store that is
+ *  already open. */
+function classifyThrown(e) {
+  const k = e && e.kind;
+  if (k === "locked" || k === "missing" || k === "provider" || k === "no-store" || k === "timeout") return k;
+  if (k === "other") return "provider";
+  const m = (e && e.message) || String(e);
+  if (/^provider '/.test(m)) return "provider";
+  if (/locked/i.test(m)) return "locked";
+  if (/no such cred/i.test(m)) return "missing";
+  if (/timed out/i.test(m)) return "timeout";
+  return "provider";
+}
+
+function withDeadline(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise).finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(Object.assign(new Error(`${what} timed out after ${ms}ms`), { kind: "timeout" })), ms);
+    }),
+  ]);
+}
+
+/** Human-readable fix for each kind, so no uck writes its own creds advice (and
+ *  none of them can get `locked` vs `missing` wrong a second time).
+ *  Also accepts a SUCCESS result ({token, src}) and describes where the value
+ *  came from — a uck's `urls`-style diagnostic must be able to report
+ *  provenance from the same helper that produced the token, not invent its own
+ *  wording for the same states. */
+export function credHint(res, { credName } = {}) {
+  // Success reads as provenance, not as an error: a uck's `urls`-style
+  // diagnostic reports where a token came from, and that answer must come from
+  // the same helper that produced it rather than from wording the uck invented
+  // (invented wording is how `urls` ended up lying about a permanent store).
+  //
+  // `token` is the success test. A hit carries { token, src } and no `reason`;
+  // a failure carries { token: null, reason }. Testing `reason` first made every
+  // success fall through to the default branch and print "unavailable (unknown)"
+  // — the same class of bug as reporting a permanent store as locked, one layer
+  // up: inferring state from the absence of a field instead of the field that
+  // means it.
+  if (res && res.token != null && res.token !== "") {
+    return res.localOnly
+      ? `${res.src} — read without the creds uck; a vault-backed value would have been invisible`
+      : res.src;
+  }
+  const name = credName ?? res?.host ?? "<name>";
+  switch (res?.reason) {
+    case "locked":
+      return `creds are locked\n  unlock it: f creds unlock`;
+    case "missing":
+      return res.localOnly
+        ? `no credential named '${name}' in the local store (read without the creds uck, so a vault-backed value could not be seen)`
+        : `no credential named '${name}'\n  store it: f creds set ${name} <value>\n  names already stored: f creds ls`;
+    case "provider":
+      return `a credential provider was reached but failed for '${name}':\n  ${res.detail}\n  fix that first — the value may already exist in the vault`;
+    case "no-store":
+      return `the credential store could not be reached at all (no creds uck, no daemon on the socket)\n  this is not "not configured": check the f install / run f creds status`;
+    case "timeout":
+      return `timed out waiting for '${name}'\n  set it in another terminal: f creds fill ${name}\n  open requests: f creds waiters`;
+    default:
+      return `credential '${name}' unavailable (${res?.reason ?? "unknown"})`;
+  }
+}
+
 /**
  * Wait for a cred to be available, blocking up to `timeout` ms.
  *
@@ -1148,8 +1455,20 @@ export function register(ctx) {
     // (>=1: CredsError with .kind is thrown; message text is NOT an API).
     // v2: `lock` takes { purge }, `unlock` takes a third options argument, and a
     // configured permanent unlock starts its own daemon on get/set/ls/resolve.
+    // v3: `resolveCred`/`credHint`/`credNamesFor` — the ONE sanctioned way for a
+    //     uck to obtain a credential. get/set/ls/resolve stay for a caller that
+    //     already knows the store is open; a consumer that must decide
+    //     locked-vs-missing itself should call resolveCred and never read
+    //     ~/.f/.creds-daemon. See CONTRACT.md §6.1.
     credsApi: {
-      version: 2,
+      version: 3,
+      resolveCred,
+      credHint,
+      credNamesFor,
+      /** Last resort for a process with no creds uck in its registry; exposed so
+       *  a uck does not hand-roll a socket client and mislabel "unreachable" as
+       *  "not configured". Returns the same shape as resolveCred. */
+      rawCredRead,
       async get(name, ttl) {
         const state = await apiState();
         if (!state) throw CredsError.locked();
@@ -1171,13 +1490,64 @@ export function register(ctx) {
       async set(name, value) {
         const state = await apiState();
         if (!state) throw CredsError.locked();
-        await daemonCall({ op: "set", name, value }, state.socket);
+        const r = await daemonCall({ op: "set", name, value }, state.socket);
+        if (!r.ok) throw toCredsError(name, new Error(r.error ?? `could not store '${name}'`));
+      },
+      /** Store raw bytes (a PEM, a key file). The value goes over the daemon
+       *  socket, never argv, so nothing appears in `ps`. The daemon trims string
+       *  values on read, which is why a caller that needs its bytes back intact
+       *  must write them with this and read them with `getRaw`. Added in v3:
+       *  `f vaultwarden` previously hand-rolled the socket `set` because
+       *  `credsApi.set` swallowed the daemon's error reply and reported a failed
+       *  write as success. */
+      async setRaw(name, buf) {
+        const state = await apiState();
+        if (!state) throw CredsError.locked();
+        const b = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf), "utf8");
+        const r = await daemonCall({ op: "set", name, value: { b64: b.toString("base64") } }, state.socket);
+        if (!r.ok) throw toCredsError(name, new Error(r.error ?? `could not store '${name}'`));
+      },
+      /** Byte-exact read, for a value whose bytes are the contract (a PEM key:
+       *  `ssh-add -` rejects one whose trailing newline was trimmed). Throws the
+       *  same CredsError kinds as `get`. Added in v3 — before that, `f ssh` called
+       *  a `credsApi.getRaw` that had never existed, so it silently fell back to
+       *  its own socket read, which cannot see a provider-backed (mirror) key. */
+      async getRaw(name) {
+        const state = await apiState();
+        if (!state) throw CredsError.locked();
+        const r = await rawLookup(name, state);
+        if (r.value != null && r.value.length) return r.value;
+        if (r.error) throw CredsError.provider(name, "provider", r.error);
+        throw CredsError.missing(name);
       },
       async ls() {
         const state = await apiState();
         if (!state) throw CredsError.locked();
         const r = await daemonCall({ op: "ls" }, state.socket);
         return r.names ?? [];
+      },
+      /** Delete a credential. A secret deletion, so it reports failure instead
+       *  of returning false and letting the caller assume it happened (this is
+       *  how `f vaultwarden credsRm` quietly lost deletions). Mirrors are real
+       *  entries: rm 'mirror:<name>' deletes the copy of someone else's secret. */
+      async rm(name) {
+        const state = await apiState();
+        if (!state) throw CredsError.locked();
+        const r = await daemonCall({ op: "rm", name }, state.socket);
+        if (!r.ok) throw toCredsError(name, new Error(r.error ?? `could not remove '${name}'`));
+        // A deleted local name must not keep answering from its mirror, and the
+        // miss cache must not hide the fact that it is gone.
+        clearMisses(name);
+        return true;
+      },
+      /** Does this name exist, without returning the value? `has` is a pre-filter:
+       *  it never touches providers (a provider answer would need a network call,
+       *  and a timeout there reads as "not mine" rather than "broken"). */
+      async has(name) {
+        const state = await apiState();
+        if (!state) throw CredsError.locked();
+        const r = await daemonCall({ op: "has", name }, state.socket);
+        return !!r.exists;
       },
       /**
        * Wait for a cred, blocking up to timeout (default 5 min). Resolves to the

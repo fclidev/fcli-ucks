@@ -114,12 +114,27 @@ export async function collect({ verbose } = {}) {
  *
  * Returns found[] with an extra `probe: "ok" | <problem string>` field.
  */
+/**
+ * Every child that runs a provider probe must carry the recursion marker.
+ *
+ * `creds/providers.js` honours `F_CREDS_NO_PROVIDER` and cuts discovery, and a
+ * provider honours it to answer "configured" without touching the store. This
+ * uck spawns the same probes and did not set it, so a provider's `status` read a
+ * live store here while the marker said it should not — which is how
+ * `f providers` came to print `vaultwarden: not ready — creds locked` next to a
+ * `f creds status` saying `unlocked`. The marker is the single fact every probe
+ * caller needs, so it is set here once rather than left to each call site (and
+ * to `f providers` is not the only one: see the readiness section below).
+ */
+const probeEnv = () => ({ ...process.env, F_CREDS_NO_PROVIDER: "1" });
+
 export async function checkProbes(found) {
   const { execFileSync } = await import("node:child_process");
   for (const p of found) {
     try {
       const out = execFileSync(process.execPath, [p.entry, "status"], {
         encoding: "utf8", timeout: 20000, stdio: ["ignore", "pipe", "pipe"],
+        env: probeEnv(),
       });
       JSON.parse(out); // must be machine-readable
       p.probe = "ok";
@@ -161,6 +176,7 @@ export function register(_ctx) {
             const { execFileSync } = await import("node:child_process");
             const st = JSON.parse(execFileSync(process.execPath, [p.entry, "status"], {
               encoding: "utf8", timeout: 20000, stdio: ["ignore", "pipe", "pipe"],
+              env: probeEnv(),
             }));
             process.stdout.write(`  ${p.name}: ${st.ready ? "ready" : "not ready"}${st.note ? ` — ${st.note}` : ""}${st.hint ? `\n    ${st.hint}` : ""}\n`);
           } catch (e) {

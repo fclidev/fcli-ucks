@@ -240,6 +240,17 @@ const server = net.createServer((socket) => {
           break;
         }
         case "set": {
+          // --- Guard 0: the name must be a non-empty string. box.entries is a
+          // plain object, so a null/undefined/object name stringifies to
+          // "null"/"undefined"/"[object Object]" and writes an entry that no
+          // later `get` can address by intent: the store silently accumulates
+          // junk (measured: `credsApi.set(null, "v")` created an entry literally
+          // keyed "null"). A caller bug must fail loudly here rather than be
+          // persisted, because the damage survives the process and the lock.
+          if (typeof req.name !== "string" || !req.name) {
+            resp = { ok: false, error: `set needs a non-empty string name (got ${typeof req.name})` };
+            break;
+          }
           // --- Guard 2: never encrypt new entries with a key that matches
           // nothing on disk. This is the actual corruption step, so it is the
           // last place to refuse. A store with one unrelated bad entry is still

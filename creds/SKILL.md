@@ -196,6 +196,35 @@ Example — pi models.json (replaces the old `f pi-models`):
 `f creds files pack ~/.pi/agent/models.json` on one host, `f creds files unpack
 ~/.pi/agent/models.json` on another (same unlocked store).
 
+## For uck authors: one interface
+
+Any uck that needs a credential calls credsApi and nothing else:
+
+```js
+const api = ctx.registry.creds.credsApi;          // v3
+const r = await api.resolveCred({ host: baseUrl, flagToken, envVars, waitMs });
+if (r.token == null) die(`no token\n  ${api.credHint(r, { credName: r.host })}`);
+```
+
+One call answers found / `locked` / `missing` / `provider` / `no-store` /
+`timeout`, runs the provider ladder, and derives candidate names from a base URL
+(`host:port`, then bare host). `raw: true` keeps bytes (a PEM needs its trailing
+newline). There is no second path:
+
+- **Do not read `~/.f/.creds-daemon` or open `~/.f/.creds.sock`.** Both are
+  internal (CONTRACT.md §6.1 C0/C4). A permanent unlock stores `ttl: null`, so
+  `!lf.ttl` or `start + ttl*1000` calls it *expired at t=0* — which is how six
+  ucks came to report `creds are locked` on a box `f creds status` called
+  `unlocked (permanent)`. A lockfile read also cannot restart a permanent
+  daemon, so it can never recover the reboot case by itself.
+- **Do not match creds error text.** `resolveCred` returns a `reason`; if you use
+  `get`/`resolve` directly, branch on `err.kind`.
+- **Print `credHint(r)`, not your own wording**, so your failure message cannot
+  drift from `f creds status`.
+- No `credsApi` in the registry? `api.rawCredRead(names)` is still creds' code and
+  still says `no-store` rather than "not configured". With no creds at all, say
+  `no-store` and point at `f creds status`.
+
 ## Conventions
 
 - Name a cred after what it authenticates: `forgejo.kensand.net` for a Forgejo token, `github.com` for a GitHub token, `npmjs.com` for an npm token. `f fj` looks up the cred named after the resolved base-URL host.

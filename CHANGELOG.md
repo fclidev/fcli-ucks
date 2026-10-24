@@ -2,6 +2,54 @@
 
 All notable changes to the default uck bundle.
 
+## [Unreleased]
+
+### Added
+- **`creds`: `credsApi` is now the single interface into the store**
+  (`credsApi.version` → 3). `resolveCred({names|host, flagToken, envVars, waitMs,
+  raw})` answers the whole question in one call and returns a §7.2 `reason`
+  (`locked` / `missing` / `provider` / `no-store` / `timeout`) instead of
+  throwing; `credHint()` returns the matching remediation text (or, for a hit,
+  the provenance line) so no uck writes its own creds advice; `rawCredRead()` is
+  the sanctioned read for a process with no `credsApi`; `getRaw`/`setRaw` are
+  byte-exact; `rm`/`has` exist so a peer need not shell out per name. CONTRACT.md
+  §6.1 states the rule (C0) and §6.1 C4 makes the lockfile internal.
+
+### Fixed
+- **`creds`: `set` reported success when the daemon refused the write.** It
+  returned `undefined` whatever the reply said.
+- **`gh`, `grocy`, `ha`, `ha-ws`, `ssh`, `fj`: every one of them reported
+  `creds are locked` on a permanently unlocked box** — the split-brain where
+  `f creds status` next to it says `unlocked (permanent)`. Each had copied
+  creds' lockfile check, and every copy tested `!lf.ttl` or computed
+  `start + ttl*1000`; a permanent unlock stores `ttl: null`, so all six called it
+  "expired at t=0" and never asked the uck that owns the answer. Worse, a file
+  read cannot restart a permanent daemon, so the reboot/OOM case was
+  unrecoverable from a consumer no matter how the arithmetic was written. All six
+  now call `resolveCred`; the copies are deleted, along with
+  `lib/credsresolve.js` (which carried the same bug into `f ha`).
+- **`ssh`: `credsApi.getRaw` never existed**, so the intended path always threw
+  and its socket fallback answered instead — which cannot see a provider-backed
+  (mirror) key, i.e. a vault-stored key looked like "no key stored". v3 adds
+  `getRaw`; `f ssh` uses `resolveCred({raw: true})` and keeps the trailing
+  newline `ssh-add -` requires.
+- **`vaultwarden`: `credsRm` swallowed every failure into `return false`** and
+  shelled out one `f` per name; it now awaits `credsApi.rm`. Its `credsStatus`
+  regexed the first line of `f creds status` output for "unlocked"; it asks
+  `describeStatus()`.
+- **`fj`: `urls` passed `credsApi = null`** "because it never waits", so the
+  diagnostic printed `(none: locked)` for a permanently unlocked box while
+  `f fj whoami` worked two commands later.
+- **`creds`: `resolveCred({waitMs})` returned `missing` in 0ms** on an open box
+  instead of blocking, because the wait branch only ran while locked. `--wait`
+  therefore behaved as "wait" on a locked store and "fail fast" on an open one.
+  It also burned the 30s read timeout as the total wait, turning `--wait 4` into
+  a 30s hang.
+
+### Notes
+- Nothing in the consumer path may read `~/.f/.creds-daemon` or connect
+  `~/.f/.creds.sock`. Grep for both before adding a uck that needs a credential.
+
 ## [0.4.0]
 
 ### Added

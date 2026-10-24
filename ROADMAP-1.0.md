@@ -90,8 +90,9 @@ and the only one that can answer "what did I shadow?" (N9, §6.3). Recorded in
 CONTRACT.md N20/N20a.
 
 My objection was never "keep both" — it was that removing _`registry`_ would be
-a **silent** break, because `lib/credsresolve.js` takes `credsApi` as a
-parameter and so cannot reach `ctx.uck()` below `run()`. Reversing the direction
+a **silent** break, because `lib/credsresolve.js` (since deleted — its job is
+`credsApi.resolveCred`, see CONTRACT.md §6.1 C0) took `credsApi` as a
+parameter and so could not reach `ctx.uck()` below `run()`. Reversing the direction
 dissolves it: deleting `ctx.uck` is loud (`f: ctx.uck is not a function`) and
 run-time `ctx` is rebuilt per invocation, so no stale capture exists.
 **One call site migrates:** `gh/index.js:368`.
@@ -452,7 +453,9 @@ Two fixes:
   carry two names for one lookup.
 - **Cross-bucket shared `lib/`.** Rejected in favour of publish-only buckets;
   CONTRACT.md N4 + §5 P7. Consequence worth stating plainly: `lib/uckmain.js`
-  and `lib/creds-error.js` are deliberately **duplicated** per bucket, and
+  and `lib/creds-error.js` were deliberately **duplicated** per bucket (the
+  creds one is now private inside the creds uck: peers get §7.2 kinds from
+  `resolveCred` and have nothing left to classify at a distance), and
   `resolve()`'s child-process transport means a provider cannot consume a
   bucket-level shared lib at all. Both are contract text now, not accidents.
 - **`status --json` (B4).** Not implemented: no consumer exists. The probe

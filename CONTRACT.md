@@ -432,58 +432,109 @@ Anything beyond §5. A uck may expose any data or functions on its registered
 object; peers read them via `ctx.registry` (N20 — the sole accessor).
 Two exist today:
 
-### 6.1 `creds` → `credsApi`
+### 6.1 `creds` → `credsApi` (the ONLY interface into the store)
+
+A uck that needs a credential calls `resolveCred` and nothing else. It does not
+read `~/.f/.creds-daemon`, does not connect `~/.f/.creds.sock`, and does not
+match another uck's error strings.
 
 ```js
 creds.credsApi = {
-  version?: 2,                  // §7.2: gates whether `kind` is guaranteed
-  get(name, ttl?),              // → value; throws CredsError (G5) or Error
-  set(name, value),
-  ls(),                         // → [names]
-  wait(name, opts?),            // block up to timeout (default 5 min)
+  version: 3,                   // §7.2: gates whether `kind` is guaranteed
+
+  // --- the consumer path (use this) ---
+  resolveCred({ names | host,   // names = explicit list; host/base = names derived by creds
+                flagToken, envVars, waitMs, localOnly, raw, timeoutMs }),
+                                // → { token, src, source?, warning? }
+                                // → { token: null, reason, host?, detail? }
+                                //   reason ∈ §7.2: locked|missing|provider|no-store|timeout
+  credHint(res, { credName }),  // → the remediation text for that result (or the
+                                //   provenance line for a hit). Print this; do not
+                                //   write your own creds advice.
+  credNamesFor(base),           // → ["host:port", "host"] — cred naming is creds' rule
+  rawCredRead(names, ms, raw),  // the sanctioned no-credsApi read (C3); reports
+                                //   no-store when the daemon is unreachable
+
+  // --- single-name primitives, for a caller that already knows the store is open ---
+  get(name, ttl?), set(name, value), setRaw(name, buf), getRaw(name),
+  rm(name), has(name), ls(),
+  resolve(name, opts?),         // → { value, source, warning? } or throws
+  wait(name, opts?), waiters(), // waiter registry that `f creds waiters`/`fill` read
   unlock(passkey?, ttl?, { permanent, keyFile, createKey, keyLabel }),
-  lock({ purge }),
-  permanentUnlock(),            // → key-file path | null; read-only, starts nothing
-  describeStatus(),             // → the same unlock line `f creds status` prints
-  // … plus request/waiters helpers
+  lock({ purge }), permanentUnlock(), status(), describeStatus(), providers(),
 }
 ```
 
-Version 2 adds the permanent file-based unlock and changes one behaviour peers
-can observe: `get`/`set`/`ls`/`resolve` will start a daemon *themselves* when a
+**C0 — one interface, one state machine.** "Unlocked" is not a fact a consumer
+can compute; it is a decision this uck makes *and acts on*. A permanent unlock
+(`f creds unlock --permanent`) stores `{ttl: null, permanent: true}`, and a
+configured permanent daemon **restarts itself** from its key file after a reboot,
+OOM kill or `kill -9`. A peer that re-derives state from the lockfile can get
+the first half wrong (testing `!ttl`, or computing `start + ttl*1000`, calls a
+permanent session *expired at t=0*) and can never get the second half right (a
+file read cannot spawn a daemon). Six ucks did exactly that and all six reported
+`creds are locked` beside a `f creds status` that said `unlocked (permanent)`.
+So: ask, don't peek. If a new state ever needs to be readable without acting on
+it, it is added here, in one place.
+
+**Version 3** is that consolidation, plus gaps it exposed:
+
+| added | why it was missing |
+|---|---|
+| `resolveCred` / `credHint` / `credNamesFor` | the consumer path; previously re-implemented six times |
+| `rawCredRead` | C3's fallback was "hand-roll the socket", which is how `no-store` got reported as "not configured" |
+| `getRaw` | `f ssh` had been calling this name for its whole life; it never existed, so the intended path always threw and its socket fallback answered — which cannot see a provider-backed (mirror) key |
+| `setRaw` | `f vaultwarden` hand-rolled the socket `set` because `set` had no byte-exact form |
+| `set` throws on failure | it returned `undefined` whatever the daemon said, so a refused write reported success |
+| `rm` / `has` | `f vaultwarden` shelled out per name and swallowed failures into `return false` |
+
+Version 2 added the permanent file-based unlock and changed one behaviour peers
+can observe: `get`/`set`/`ls`/`resolve` start a daemon *themselves* when a
 permanent unlock is configured (`~/.f/.creds-unlock` + its key file). A locked
-store with no permanent unlock still throws `kind: "locked"` exactly as before —
-nothing in v2 prompts, and nothing in v2 does provider traffic while locked.
+store with no permanent unlock still throws `kind: "locked"` — nothing prompts,
+and nothing does provider traffic while locked.
 
 - **C1.** `get` runs the full provider ladder (local box, then providers,
   mirroring). While locked it throws — callers must treat *locked* and
   *missing* as **different** failures.
-- **C2. (GAP G5 — the worst coupling in the tree today)** Peers currently
+- **C2. (G5, and closed by v3 for the consumer path)** Peers used to
   distinguish locked/missing by **regexing the error message**
   (`/locked/i.test(msg)`, `/no such cred/i.test(msg)`) in ssh, gh, ha, fj.
-  That is string coupling to another uck's wording. Branch on structure
-  instead — `err.kind`, vocabulary in §7.2. **`kind` is the contract; the
-  `CredsError` class is not** (§7.3): never `instanceof` it from another uck,
-  and never import it from a sibling bucket (that would also violate N4).
-- **C3.** A peer that can't get `credsApi` (registry absent, or the uck
-  not installed) must fall back to reading the creds **socket directly** or
-  report locked/missing in its own status output.
+  That is string coupling to another uck's wording. `resolveCred` removes the
+  choice: it returns a `reason` from §7.2 instead of throwing, so there is
+  nothing left to regex on the consumer path. Callers still using `get`/`resolve`
+  branch on `err.kind` (§7.2). **`kind` is the contract; the `CredsError` class
+  is not** (§7.3): never `instanceof` it from another uck, and never import it
+  from a sibling bucket (that would also violate N4).
+- **C3.** A peer that cannot get `credsApi` (registry absent, or the creds uck
+  not installed) calls `credsApi.rawCredRead` — which is still creds' code and
+  still distinguishes `locked` from `no-store`. It must NOT open the socket
+  itself: hand-rolled clients are where "the daemon is unreachable" got reported
+  to users as "you never configured this". If there is no `credsApi` at all, say
+  `no-store` and point at `f creds status`; do not guess from the filesystem.
 - **C4. The creds socket protocol** (`~/.f/.creds.sock`, one JSON object per
   request, one JSON reply). Ops: `get` (value, or base64 with `b64: true`),
   `set` (value, optional `expiresAt` for mirrors), `has`, `ls`, `meta`, `rm`,
   `ping` (liveness only — replies `{ok, permanent}` and decrypts nothing, so it
   stays fast on a large box and cannot time out a probe into starting a second
   daemon). Replies: `{ ok: true, value? }` or `{ ok: false, error }`. The
-  lockfile is `~/.f/.creds-daemon` (`{ pid, start, ttl, socket, permanent }`);
-  peers read it directly for a non-blocking locked/unlocked check. **`ttl` is
-  `null` when `permanent` is true** — a peer computing `start + ttl*1000` must
-  treat `permanent: true` as "no deadline" and a non-finite `ttl` as expired
-  (refuse service), never as "never expires". Shared helpers:
-  `fcli-ucks/lib/creds-error.js`
-  (`classifyCredsError`) and the personal bucket's `lib/credsresolve.js`
-  (`resolveCred`). Both are **duplicated per bucket by design** (N4/P7), and
-  both must translate into the §7.2 vocabulary — their private reason codes are
-  implementation detail, not interface (see the retired-vocabulary table).
+  lockfile is `~/.f/.creds-daemon` (`{ pid, start, ttl, socket, permanent }`),
+  where **`ttl` is `null` when `permanent` is true** and `start` is then only the
+  session age for `f creds status`.**
+
+  The lockfile is **internal to the creds uck.** Peers do not read it. It used to
+  say "peers read it directly for a non-blocking locked/unlocked check", and that
+  one sentence produced six copies of a state machine that had to be kept in step
+  by hand — and were not. `permanent: true` means *no deadline*, and
+  `apiState()` treats a non-finite `ttl` without that flag as expired (refuse
+  service, never "never expires"); a consumer that reimplements either half will
+  eventually get it wrong, and getting it wrong looks like "creds are locked" on
+  a machine that is permanently open. Ask `credsApi` instead (§6.1 C0).
+
+  There is no longer a shared helper lib to keep in step: `lib/credsresolve.js`
+  is deleted and `classifyCredsError` lives in the creds uck as `classifyThrown`,
+  private. Consumers get §7.2 kinds from `resolveCred`, so there is nothing left
+  to classify at a distance.
 
 ### 6.2 `uck` → `uckApi` (informative — not yet a stable surface)
 
@@ -567,11 +618,13 @@ and must translate at its boundary; callers must not spread the alias:
 
 | retired | where it came from | now |
 |---|---|---|
-| `unset` | `credsresolve.js` reason | `missing` |
-| `wait-timeout` | `credsresolve.js` reason | `timeout` |
-| `no-names` | `credsresolve.js` reason | caller bug — built no names, make no call |
+| `unset` | old per-uck resolvers | `missing` |
+| `wait-timeout` | old per-uck resolvers | `timeout` |
+| `no-names` | old per-uck resolvers | caller bug — built no names, make no call (`resolveCred` throws rather than answering for an empty list) |
+| `no-creds-uck` | `f gh` before v3 | `no-store` |
+| `no-token` / `missing-token` | `f ha` / `f grocy` | their own domain: "the base url resolved, the key did not". Not a creds kind — creds answered `missing` for one specific name. Keep, but never print it instead of a creds kind when creds gave one |
 | `error` | `classifyCredsError` bucket | `provider` / `no-store` / `other` |
-| `""` (empty reason) | `credsresolve.js` | success, or `missing` |
+| `""` (empty reason) | old per-uck resolvers | success, or `missing` |
 
 `"other"` stays legitimate **only** for a uck's own internal catch-all. A
 credential failure reported *to a user* must name one of the five kinds with
