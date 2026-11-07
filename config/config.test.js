@@ -1,5 +1,10 @@
 // Tests for the config uck. Run from the fcli-ucks bucket root:
-//   npx vitest run config/config.test.js
+//   node --test config/config.test.js
+//
+// On node:test, not vitest: this repo has zero devDependencies and no lockfile
+// by design, so the runner has to be something Node already ships. This file
+// used to import vitest, which is declared nowhere, so `npm test` was red at
+// HEAD -- 3 pass / 1 fail, on an otherwise green tree.
 //
 // Two traps this file is shaped around, both learned the hard way:
 //
@@ -18,7 +23,8 @@
 // argv parsing and error handling too, not just the helpers, and the file under
 // test is unambiguously this one.
 
-import { test, expect, describe } from "vitest";
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,8 +32,8 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 // The runner is invoked with a path relative to the repo root, and the child's
-// cwd is the repo root, so ./config/run-uck.mjs resolves however vitest is
-// started (from the bucket root or via `npx vitest run config/config.test.js`).
+// cwd is the repo root, so ./config/run-uck.mjs resolves however the runner is
+// started (from the bucket root or via `node --test config/config.test.js`).
 const HERE = new URL("./", import.meta.url).pathname;
 const REPO = join(HERE, "..");
 
@@ -99,21 +105,21 @@ describe("add creates the array instead of losing the value (C7)", () => {
       // setPathCreate(doc, path, undefined), which assigned undefined — so the
       // key never survived JSON.stringify and the value was gone.
       const r = await runConfig(["add", "ucks", "github:user/repo"], { home, cwd, file });
-      expect(r.code).toBe(0);
-      expect(r.doc.ucks).toEqual(["github:user/repo"]);
+      assert.equal(r.code, 0);
+      assert.deepEqual(r.doc.ucks, ["github:user/repo"]);
     }));
 
   test("appends to an existing array", async () =>
     withHome(async ({ home, cwd, file }) => {
       write(file, { ucks: ["first"] });
       const r = await runConfig(["add", "ucks", "second"], { home, cwd, file });
-      expect(r.doc.ucks).toEqual(["first", "second"]);
+      assert.deepEqual(r.doc.ucks, ["first", "second"]);
     }));
 
   test("explicit [$] append on a fresh config", async () =>
     withHome(async ({ home, cwd, file }) => {
       const r = await runConfig(["add", "ucks[$]", "x"], { home, cwd, file });
-      expect(r.doc.ucks).toEqual(["x"]);
+      assert.deepEqual(r.doc.ucks, ["x"]);
     }));
 
   test("objects, not just strings", async () =>
@@ -124,7 +130,7 @@ describe("add creates the array instead of losing the value (C7)", () => {
         cwd,
         file,
       });
-      expect(r.doc.ucks).toEqual([{ source: "a" }, { source: "b", name: "n" }]);
+      assert.deepEqual(r.doc.ucks, [{ source: "a" }, { source: "b", name: "n" }]);
     }));
 
   test("a positional path is refused, not turned into a {\"0\": …} object", async () =>
@@ -132,10 +138,10 @@ describe("add creates the array instead of losing the value (C7)", () => {
       // The old fallback built {"ucks":{"0":["b"]}} — an object where core
       // expects an array, so every later f command failed to read the source.
       const r = await runConfig(["add", "ucks[0]", "z"], { home, cwd, file });
-      expect(r.code).toBe(1);
-      expect(r.err).toMatch(/position/);
-      expect(r.err).toMatch(/f config add ucks/); // names the operation that works
-      expect(r.doc).toBeUndefined(); // nothing written
+      assert.equal(r.code, 1);
+      assert.match(r.err, /position/);
+      assert.match(r.err, /f config add ucks/); // names the operation that works
+      assert.equal(r.doc, undefined); // nothing written
     }));
 
   test("an index past the end is refused instead of creating a hole", async () =>
@@ -145,22 +151,22 @@ describe("add creates the array instead of losing the value (C7)", () => {
       write(file, { ucks: ["a"] });
       const before = readFileSync(file, "utf8");
       const r = await runConfig(["add", "ucks[5]", "b"], { home, cwd, file });
-      expect(r.code).toBe(1);
-      expect(readFileSync(file, "utf8")).toBe(before);
+      assert.equal(r.code, 1);
+      assert.equal(readFileSync(file, "utf8"), before);
     }));
 
   test("sibling keys survive", async () =>
     withHome(async ({ home, cwd, file }) => {
       write(file, { skills: [{ name: "s", path: "p" }] });
       const r = await runConfig(["add", "ucks", "u"], { home, cwd, file });
-      expect(r.doc).toEqual({ skills: [{ name: "s", path: "p" }], ucks: ["u"] });
+      assert.deepEqual(r.doc, { skills: [{ name: "s", path: "p" }], ucks: ["u"] });
     }));
 
   test("a second add on the created array works (the array is real)", async () =>
     withHome(async ({ home, cwd, file }) => {
       await runConfig(["add", "ucks", "a"], { home, cwd, file });
       const r = await runConfig(["add", "ucks", "b"], { home, cwd, file });
-      expect(r.doc.ucks).toEqual(["a", "b"]);
+      assert.deepEqual(r.doc.ucks, ["a", "b"]);
     }));
 });
 
@@ -175,16 +181,16 @@ describe("store-source guard (C1a, enforced when the source is written)", () => 
         cwd,
         file,
       });
-      expect(r.code).toBe(1);
-      expect(r.err).toMatch(/point into the store/);
-      expect(readFileSync(file, "utf8")).toBe(before);
+      assert.equal(r.code, 1);
+      assert.match(r.err, /point into the store/);
+      assert.equal(readFileSync(file, "utf8"), before);
     }));
 
   test("refuses the store dir itself", async () =>
     withHome(async ({ home, cwd, file }) => {
       const r = await runConfig(["add", "ucks", join(home, ".f", "ucks")], { home, cwd, file });
-      expect(r.code).toBe(1);
-      expect(r.err).toMatch(/point into the store/);
+      assert.equal(r.code, 1);
+      assert.match(r.err, /point into the store/);
     }));
 
   test("git URLs, npm specs and external paths are untouched", async () =>
@@ -197,10 +203,10 @@ describe("store-source guard (C1a, enforced when the source is written)", () => 
       ];
       for (const spec of specs) {
         const r = await runConfig(["add", "ucks", spec], { home, cwd, file });
-        expect(r.code, `should accept ${spec}, got: ${r.err}`).toBe(0);
+        assert.equal(r.code, 0, `should accept ${spec}, got: ${r.err}`);
       }
-      expect(readFileSync(file, "utf8")).toBeDefined();
-      expect(JSON.parse(readFileSync(file, "utf8")).ucks).toHaveLength(specs.length);
+      assert.ok(readFileSync(file, "utf8") !== undefined);
+      assert.equal(JSON.parse(readFileSync(file, "utf8")).ucks.length, specs.length);
     }));
 });
 
@@ -214,9 +220,9 @@ describe("errors are one line plus the fix (R3), not a stack trace", () => {
       write(file, { ucks: ["github:keep/me"] });
       mkdirSync(join(home, ".f", "ucks", "y"), { recursive: true });
       const r = await runConfig(["add", "ucks", join(home, ".f", "ucks", "y")], { home, cwd, file });
-      expect(r.code).toBe(1);
-      expect(r.err).toMatch(/^f: /);
-      expect(r.err).not.toMatch(/\n\s+at .*:\d+:\d+\)/);
+      assert.equal(r.code, 1);
+      assert.match(r.err, /^f: /);
+      assert.doesNotMatch(r.err, /\n\s+at .*:\d+:\d+\)/);
     }));
 
   test("a usage error still delivers stdout written before it", async () =>
@@ -244,15 +250,15 @@ describe("errors are one line plus the fix (R3), not a stack trace", () => {
         cwd,
         env: { ...process.env, HOME: home },
       });
-      expect(r.stdout.length).toBeGreaterThanOrEqual(300000);
-      expect(r.status).toBe(1);
+      assert.ok(r.stdout.length >= 300000);
+      assert.equal(r.status, 1);
     }));
 
   test("missing operands still print usage", async () =>
     withHome(async ({ home, cwd, file }) => {
       const r = await runConfig(["add", "ucks"], { home, cwd, file });
-      expect(r.code).toBe(1);
-      expect(r.err).toMatch(/usage: f config/);
+      assert.equal(r.code, 1);
+      assert.match(r.err, /usage: f config/);
     }));
 });
 
@@ -261,8 +267,8 @@ describe("list", () => {
     withHome(async ({ home, cwd, file }) => {
       write(file, { ucks: ["github:a/b"] });
       const r = await runConfig(["list"], { home, cwd, file });
-      expect(r.code).toBe(0);
-      expect(r.out).toMatch(/github:a\/b/);
+      assert.equal(r.code, 0);
+      assert.match(r.out, /github:a\/b/);
     }));
 });
 
@@ -270,11 +276,11 @@ describe("set / get / remove", () => {
   test("round-trip", async () =>
     withHome(async ({ home, cwd, file }) => {
       await runConfig(["set", "ucks[0]", "./a"], { home, cwd, file });
-      expect(JSON.parse(readFileSync(file, "utf8")).ucks[0]).toBe("./a");
+      assert.equal(JSON.parse(readFileSync(file, "utf8")).ucks[0], "./a");
       const got = await runConfig(["get", "ucks[0]"], { home, cwd, file });
-      expect(got.out.trim()).toBe("./a");
+      assert.equal(got.out.trim(), "./a");
       await runConfig(["remove", "ucks[0]"], { home, cwd, file });
-      expect(JSON.parse(readFileSync(file, "utf8")).ucks).toEqual([]);
+      assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).ucks, []);
     }));
 
   test("programmatic add stores a real array, not String(array)", async () =>
@@ -291,6 +297,6 @@ describe("set / get / remove", () => {
       } finally {
         process.env.HOME = prev;
       }
-      expect(JSON.parse(readFileSync(file, "utf8")).ucks).toEqual([["a", "b"]]);
+      assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).ucks, [["a", "b"]]);
     }));
 });
