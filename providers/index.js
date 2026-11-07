@@ -17,21 +17,68 @@
 // The uck's index.js must also self-dispatch when Node runs it directly, so the
 // probe protocol works without importing the provider into the creds hot path:
 //
-//   uckMain(import.meta.url, main);   // from ../lib/uckmain.js
+//   uckMain(import.meta.url, main);   // defined in this file, exported below
 //   // main() handles: --dump | resolve <name> | has <name> | status
 //
 // `f providers --dump` is the machine-readable contract `f creds` reads. Every
 // uck is imported once to collect exports; nothing is executed.
 
-import fs from "node:fs";
+import fs, { realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const F = path.join(process.env.HOME ?? "", ".f");
 
-/** Shared guard so a provider's index.js can run standalone; lives one level up
- *  because the f loader requires every uck dir to export register(ctx). */
-export { uckMain, isMain } from "../lib/uckmain.js";
+/* ---------------------------------------------------------------------------
+ * uckMain / isMain — the entry-point guard a provider's index.js needs so it
+ * can double as a CLI entry point when Node runs it directly, without firing
+ * when the `f` harness imports it. `f creds` probes providers by running
+ * `node <uck>/index.js resolve <name>` in a child process, so importing a
+ * provider must stay side-effect-free while direct execution must do work.
+ *
+ * These twelve lines are INLINED here on purpose, and exported so other
+ * provider ucks can import them from this uck. CONTRACT.md N4 forbids `../`
+ * (reaching outside your own uck dir: it breaks under bucket flattening and
+ * under a local-source copy that omits lib/), and §5 P7 makes it concrete for
+ * providers — the probe spawns `node <uck>/index.js` with node_modules
+ * resolved from the uck directory, so a bucket-level lib/ is unreachable
+ * there. N4's two legal homes for shared code are "copy it into the uck
+ * directory" (the default for small helpers) and "an npm package, when the
+ * code is large enough that duplication is worse than a dep". Twelve lines is
+ * the floor of small, and the npm option cannot work on the npm install path
+ * at all: f's installNpmSource only ever runs `npm pack`, never `npm install`,
+ * so a published helper package would never land in <uck>/node_modules.
+ * Zero deps.
+ * ------------------------------------------------------------------------ */
+
+/** True when `metaUrl` is the module Node entered this process through. */
+export function isMain(metaUrl, argv = process.argv) {
+  const self = argv[1];
+  if (!self) return false;
+  try {
+    return pathToFileURL(realpathSync(self)).href === metaUrl;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * If this file is the process entry point, call `fn(process.argv.slice(2))`.
+ * Errors go to stderr as one line and exit 1; `fn`'s own exit codes are
+ * respected (return a number to set one).
+ */
+export function uckMain(metaUrl, fn, argv = process.argv) {
+  if (!isMain(metaUrl, argv)) return;
+  Promise.resolve()
+    .then(() => fn(argv.slice(2)))
+    .then((code) => {
+      if (typeof code === "number" && code !== 0) process.exitCode = code;
+    })
+    .catch((e) => {
+      process.stderr.write(`f: ${e?.message ?? e}\n`);
+      process.exitCode = 1;
+    });
+}
 
 /** Probe subcommands a provider entry must answer. */
 export const PROBE_CMDS = ["resolve", "has", "status"];
