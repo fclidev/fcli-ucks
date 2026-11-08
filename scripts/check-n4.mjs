@@ -25,14 +25,20 @@ const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 // explicit rather than scanned so that a stray dir cannot quietly escape the gate.
 const UCKS = ["config", "creds", "providers", "search", "skills", "uck", "v"];
 
-// TESTS_ARE_EXEMPT — why test files may use `../`:
-// A test under <uck>/test/ importing `../index.js` is reaching for its OWN uck's entry,
-// one level up inside the same uck directory — not into another uck or into the bucket.
-// That is exactly what CONTRACT.md N4 permits ("sibling files in its own directory"),
-// and it is how every suite in this repo is already written (creds/test/cli.test.mjs,
-// search/test/cli.test.mjs). Tests are also never shipped: scripts/assemble.mjs skips
-// `*.test.js`, `test/` and `test.js` when it builds dist/. Gating them would flag code
-// that cannot reach a user, and would force a worse layout (tests beside sources).
+// TESTS_ARE_EXEMPT — why test files may use `../`, and why that is not a hole:
+// The two hits in this repo are `creds/test/run-command.mjs:15` and
+// `search/test/cli.test.mjs:12`, both `import { register } from "../index.js"` — a
+// test reaching for its OWN uck's entry point. N4's forbidden list is specifically
+// (1) `../..` out of the uck directory, (2) a sibling BUCKET by store path
+// (`../../<other-bucket>/lib/…`), (3) a sibling bucket via ctx.registry-then-import.
+// A single `../` that stays inside the same uck is none of those, and it is how every
+// suite here is already written. Two more reasons not to gate it: tests are never
+// shipped (scripts/assemble.mjs skips `*.test.js`, `test/` and `test.js` when it
+// builds dist/), so nothing exempted here can reach a user; and banning it would
+// force tests to sit beside sources, which is a worse layout. The exemption is
+// deliberately narrow — it exempts TEST FILES, not `../` in general, and the gate
+// still fails on any `../` in a uck's shipped source. Tighten this to `^\.\./index\.js$`
+// if a test ever starts reaching further.
 const TEST_FILE = /\.test\.(js|mjs)$/;
 const TEST_DIR = `${path.sep}test${path.sep}`;
 
