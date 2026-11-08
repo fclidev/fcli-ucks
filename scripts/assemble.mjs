@@ -22,17 +22,14 @@ const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
 
 // A uck is any top-level dir with an index.js that exports register().
 // Excluded: dist, node_modules, .git, and helper dirs without an index.js.
-// lib/ is a shared helper module (imported by ucks) — included but not
-// listed as a uck in the manifest.
+// There used to be a `shared` list here for lib/, a bucket-level helper dir.
+// It is gone: CONTRACT.md N4 forbids a uck importing `../`, so nothing may
+// reach lib/ anyway, and its one importer now carries the code itself.
 const ucks = readdirSync(root, { withFileTypes: true })
   .filter((d) => d.isDirectory())
   .map((d) => d.name)
   .filter((n) => !["dist", "node_modules", ".git", "scripts"].includes(n))
   .filter((n) => existsSync(path.join(root, n, "index.js")));
-const shared = readdirSync(root, { withFileTypes: true })
-  .filter((d) => d.isDirectory())
-  .map((d) => d.name)
-  .filter((n) => n === "lib" && existsSync(path.join(root, n, "package.json")));
 
 // Rebuild from scratch. dist/ is gitignored and cpSync never deletes, so a
 // stale dir survives every later build and npm pack ships it: ls/ and w/ were
@@ -44,7 +41,7 @@ mkdirSync(path.join(dist, "node_modules"), { recursive: true });
 
 const manifest = { name: pkg.name, version: pkg.version, ucks: {} };
 
-for (const name of [...shared, ...ucks].sort()) {
+for (const name of [...ucks].sort()) {
   const src = path.join(root, name);
   const out = path.join(dist, name);
   const files = readdirSync(src);
@@ -56,10 +53,7 @@ for (const name of [...shared, ...ucks].sort()) {
     cpSync(path.join(src, f), path.join(out, f), { recursive: true });
   }
   const uckPkgPath = path.join(out, "package.json");
-  if (shared.includes(name)) {
-    manifest.shared = manifest.shared ?? [];
-    manifest.shared.push(name);
-  } else if (existsSync(uckPkgPath)) {
+  if (existsSync(uckPkgPath)) {
     // Record the uck either way. The condition here used to be
     // `if (uckPkg.dependencies)`, so a uck with no dependencies was copied into dist/
     // and left out of the manifest: @fcli.dev/ucks@0.2.0 shipped 8 ucks and declared 1.

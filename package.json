@@ -8,7 +8,8 @@
   ],
   "scripts": {
     "build": "node scripts/assemble.mjs",
-    "test": "node --test creds/test/ config/config.test.js"
+    "check:n4": "node scripts/check-n4.mjs",
+    "test": "node scripts/check-n4.mjs && node --test config/config.test.js creds/test/ search/test/"
   },
   "publishConfig": {
     "access": "public"
