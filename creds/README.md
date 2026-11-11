@@ -3,7 +3,7 @@
 Encrypted credential store for `f`, plus the **provider** layer that lets other ucks
 answer "do you know cred `<name>`?" from some other store.
 
-Everything lives in one box at `~/.f/.creds.box`, keyed by name: secrets, whole files,
+Everything lives in one box at `~/.f/f.creds.enc`, keyed by name: secrets, whole files,
 provider mirrors, and the miss-cache. A daemon holds the derived key in memory while
 unlocked and answers over a unix socket, so a passphrase prompt happens at most once per
 TTL window — not per read.
@@ -30,7 +30,7 @@ services, no external binaries.
 | `unlock --permanent [--key-file <p>]` | never-expiring unlock driven by a 0600 key file; restarts itself after a reboot |
 | `status` | locked/unlocked, time left, providers and their readiness |
 | `import <file>` / `export` | move entries between stores |
-| `files pack/unpack/list` | whole files in the same box (`file:<abs path>`) |
+| `files pack/unpack/ls/rm` | whole files in the same box (`file:<abs path>`) — there is no `list` |
 | `request <name> [--timeout s]` | block until the cred is set elsewhere, then print it |
 | `waiters` | list open waiting requests from other terminals |
 | `forget [name…]` | drop provider mirror(s) + negative cache (no args = all) |
