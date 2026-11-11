@@ -27,7 +27,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const F = path.join(process.env.HOME ?? "", ".f");
+let F = path.join(process.env.HOME ?? "", ".f");
+
+/**
+ * Test seam: point discovery at a throwaway store root.
+ *
+ * `f` resolves its store as join(HOME, ".f", "ucks") with no env override, and F
+ * is captured at module load — so a test that wants several independent stores in
+ * one process cannot get them through the environment. This exists so
+ * providers/test/discovery.test.mjs can give every case its own store instead of
+ * sharing one and racing. Production never calls it.
+ */
+export function __setStoreRootForTests(root) {
+  F = path.join(root, ".f");
+}
 
 /** Shared guard so a provider's index.js can run standalone; lives one level up
  *  because the f loader requires every uck dir to export register(ctx). */
@@ -36,10 +49,49 @@ export { uckMain, isMain } from "../lib/uckmain.js";
 /** Probe subcommands a provider entry must answer. */
 export const PROBE_CMDS = ["resolve", "has", "status"];
 
+/**
+ * Is `p` a directory, FOLLOWING a symlink?
+ *
+ * `fs.readdirSync(..., { withFileTypes: true })` hands back `Dirent`s built from
+ * the readdir entry itself, so `Dirent.isDirectory()` is FALSE for a symlink even
+ * when the link points at a directory. Both scans below used it as their only
+ * directory test, so a uck tree staged as symlinks (a linked checkout, a store
+ * assembled out of per-uck links) came back with ZERO providers and no error of
+ * any kind: `f providers` printed the no-providers line and the run went hunting
+ * for a config problem that did not exist.
+ *
+ * `fs.statSync` follows the link, which is the question we actually care about:
+ * can this path be read as a directory. A broken link throws, and is a non-dir.
+ */
+function isDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Warn when a bucket that EXISTS contributes nothing, so a silent zero is never
+ * the only signal. Once per bucket per process, so repeated discovery does not
+ * spam. Suppressed under the recursion marker: a probe child runs this code on a
+ * path where an empty answer is expected, and noise on its stderr would be read
+ * as a provider failure by the parent that is parsing it.
+ */
+const warnedBuckets = new Set();
+function warnEmptyBucket(bucket, scanned) {
+  if (warnedBuckets.has(bucket)) return;
+  warnedBuckets.add(bucket);
+  if (process.env.F_CREDS_NO_PROVIDER) return;
+  process.stderr.write(
+    `f providers: warning: bucket ${bucket} yielded 0 ucks (scanned ${scanned} entr${scanned === 1 ? "y" : "ies"})\n`,
+  );
+}
+
 function buckets() {
   try {
     return fs.readdirSync(path.join(F, "ucks"), { withFileTypes: true })
-      .filter((d) => d.isDirectory())
+      .filter((d) => isDir(path.join(F, "ucks", d.name)))
       .map((d) => path.join(F, "ucks", d.name));
   } catch {
     return [];
@@ -57,13 +109,25 @@ export function uckDirs() {
     } catch {
       continue;
     }
+    let scanned = 0;
+    let fromBucket = 0;
     for (const ent of entries.sort((a, b) => (a.name < b.name ? -1 : 1))) {
-      if (!ent.isDirectory() || seen.has(ent.name)) continue;
-      const entry = path.join(bucket, ent.name, "index.js");
+      scanned++;
+      if (seen.has(ent.name)) continue;
+      // Directory-ness is resolved through a symlink — see isDir().
+      const dir = path.join(bucket, ent.name);
+      if (!isDir(dir)) continue;
+      const entry = path.join(dir, "index.js");
       if (!fs.existsSync(entry)) continue;
       seen.add(ent.name);
-      out.push({ name: ent.name, dir: path.join(bucket, ent.name), entry });
+      fromBucket++;
+      out.push({ name: ent.name, dir, entry });
     }
+    // A bucket that exists but contributes nothing is the silent-zero case; say
+    // so on stderr rather than letting `providers: none` stand as the whole story.
+    // This is about the SCAN: a bucket of non-provider ucks is healthy here and is
+    // reported by collect()'s own "(no credential providers…)" line, not by us.
+    if (fromBucket === 0) warnEmptyBucket(bucket, scanned);
   }
   return out;
 }
