@@ -1717,6 +1717,7 @@ export function register(ctx) {
       let lookupFd = null;        // --fd N[wa]: write the raw value to inherited fd N
       let noCache = false;        // --no-cache: ignore + clear the negative cache
       let showAll = false;        // --all (ls): include provider mirrors
+      const allFlagIdx = [];      // index of every `--all`, so `files unpack` can see it
       let permanent = false;      // --permanent: no expiry, key read from a file
       let keyFileOpt = null;      // --key-file <path>: where that key lives
       let purge = false;          // --purge (lock): delete the key file too
@@ -1742,11 +1743,17 @@ export function register(ctx) {
         } else if (a[i] === "--dry-run" || a[i] === "-n") {
           dryRun = true;
         } else if (a[i] === "--dir") {
+          // `a[++i]` already advances past the value; the extra `i++` here skipped
+          // the token AFTER it, so `--dir X --force` parsed X and then silently
+          // dropped --force (same for `--as NAME --force`). That is half of why the
+          // `--all --dir --force` guard could never fire.
           outDir = a[++i];
-          i++;
         } else if (a[i] === "--as") {
+          // `a[++i]` already advances past the value; the extra `i++` here skipped
+          // the token AFTER it, so `--dir X --force` parsed X and then silently
+          // dropped --force (same for `--as NAME --force`). That is half of why the
+          // `--all --dir --force` guard could never fire.
           asStdin = a[++i];
-          i++;
         } else if (a[i] === "--json") {
           jsonOut = true;
         } else if (a[i] === "--local") {
@@ -1757,6 +1764,11 @@ export function register(ctx) {
           showSource = true;
         } else if (a[i] === "--all") {
           showAll = true;
+          // Also remember WHERE it was, so `files unpack --all` can re-forward
+          // it. `buildUnpackSpecs` looks for `--all` in its own args, but only
+          // non-flags ever reach `pos`, so the flag was eaten here and the
+          // unpack `--all` path (and its `--all --dir --force` guard) was dead.
+          allFlagIdx.push(i);
         } else if (a[i] === "--no-cache") {
           noCache = true;
         } else if (a[i] === "--raw") {
@@ -2271,8 +2283,12 @@ export function register(ctx) {
               if (!r2.length) return usage("files pack needs <path>... | '-' | '<dir>/...'");
               await pack(expandTargets(r2), { as: asStdin, force, dryRun });
             } else if (sub === "unpack") {
-              if (!r2.length) return usage("files unpack needs <path>... | --all | '<name> -'");
-              await unpack(r2, { force, dir: outDir ? path.resolve(outDir) : null });
+              // `--all` was consumed by the top-level parser (it means `ls
+              // --all`), so it never reaches `rest`. Re-forward it when it
+              // followed `unpack` — `pos` alone can never carry it.
+              const upArgs = allFlagIdx.some((ix) => ix > 1) ? [...r2, "--all"] : r2;
+              if (!upArgs.length) return usage("files unpack needs <path>... | --all | '<name> -'");
+              await unpack(upArgs, { force, dir: outDir ? path.resolve(outDir) : null });
             } else if (sub === "ls") {
               await filesLs({ json: jsonOut });
             } else if (sub === "rm") {
@@ -2293,8 +2309,10 @@ export function register(ctx) {
             await pack(expandTargets(rest), { as: asStdin, force, dryRun });
             break;
           case "unpack":
-            if (!rest.length) return usage("unpack needs <path>... | --all | '<name> -'");
-            await unpack(rest, { force, dir: outDir ? path.resolve(outDir) : null });
+            // Same re-forward as `files unpack` — see the note there.
+            const upArgs = allFlagIdx.some((ix) => ix > 0) ? [...rest, "--all"] : rest;
+            if (!upArgs.length) return usage("unpack needs <path>... | --all | '<name> -'");
+            await unpack(upArgs, { force, dir: outDir ? path.resolve(outDir) : null });
             break;
           case "rm": {
             const [nm] = rest;

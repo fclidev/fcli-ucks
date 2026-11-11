@@ -550,6 +550,77 @@ await t("the prompt goes to stderr, not stdout — a secret never enters capture
   assert.match(run(["status"]).out, /^unlocked/, "daemon left locked for the rest of the suite");
 });
 
+/* ------------------------------------ issue #2: `files unpack --all` routing */
+
+// `--all` is a TOP-LEVEL flag (it means `ls --all`), and only non-flags ever
+// reach `pos`, so `files unpack --all` could never see it: the `!r2.length`
+// guard fired first and `buildUnpackSpecs`'s `--all` branch — plus the
+// `--all --dir --force` safety guard — were unreachable. Two bugs, both needed:
+// the flag was eaten, and `--dir`/`--as` double-incremented and swallowed the
+// flag AFTER them, so `--force` never arrived either.
+
+const packDir = path.join(TMP, "packed");
+fs.mkdirSync(packDir, { recursive: true });
+const packedFile = path.join(packDir, "one.txt");
+fs.writeFileSync(packedFile, "hello");
+
+await t("files unpack --all reaches the subcommand instead of usage-erroring", async () => {
+  run(["files", "pack", packedFile]);
+  fs.rmSync(packedFile);
+  const r = run(["files", "unpack", "--all"]);
+  assert.doesNotMatch(r.err, /files unpack needs/, `--all still eaten by the top-level parser: ${r.err}`);
+  assert.match(r.out, /restored\tfile:/, `nothing restored: ${r.out}`);
+  assert.equal(fs.readFileSync(packedFile, "utf8"), "hello", "--all did not restore the manifest");
+});
+
+await t("files unpack --all --dir <root> --force is REFUSED (the safety guard fires)", async () => {
+  const stage = path.join(TMP, "stage");
+  fs.mkdirSync(stage, { recursive: true });
+  const r = run(["files", "unpack", "--all", "--dir", stage, "--force"], { allowFail: true });
+  assert.equal(r.code, 1, `guard did not fire — bulk destructive write was allowed: ${r.out}`);
+  assert.match(r.err, /--all --dir --force is refused/, `wrong failure: ${r.err}`);
+  assert.equal(fs.readdirSync(stage).length, 0, "the guard must refuse BEFORE writing anything");
+});
+
+await t("the guard fires through the top-level `unpack` alias too", async () => {
+  const stage = path.join(TMP, "stage2");
+  fs.mkdirSync(stage, { recursive: true });
+  const r = run(["unpack", "--all", "--dir", stage, "--force"], { allowFail: true });
+  assert.equal(r.code, 1, `alias bypassed the guard: ${r.out}`);
+  assert.match(r.err, /--all --dir --force is refused/, `wrong failure: ${r.err}`);
+});
+
+await t("--dir staging WITHOUT --force still works (the guard must not over-fire)", async () => {
+  const stage = path.join(TMP, "stage3");
+  fs.mkdirSync(stage, { recursive: true });
+  const r = run(["files", "unpack", packedFile, "--dir", stage]);
+  assert.match(r.out, /restored\tfile:/, `guard over-fired or --dir broke: ${r.err}`);
+  assert.ok(fs.existsSync(path.join(stage, packedFile.replace(/^\//, ""))), "staged file missing");
+});
+
+await t("`--dir X --force` no longer swallows --force (double-increment)", async () => {
+  // Before the fix the extra `i++` skipped the token after the value, so
+  // `--force` vanished. Prove it arrives: overwrite an existing destination.
+  const other = path.join(packDir, "two.txt");
+  fs.writeFileSync(other, "one");
+  run(["files", "pack", other]);
+  fs.writeFileSync(other, "different");
+  const r = run(["files", "unpack", other, "--force"]);
+  assert.match(r.out, /restored\tfile:/, `--force lost, unpack refused to overwrite: ${r.err}`);
+});
+
+await t("top-level `ls --all` still shows mirrors (no regression)", async () => {
+  run(["set", "plain-for-all", "v"]);
+  await putMirror("mir-for-all", "v");
+  setMirrorSourceForTest("mirror:mir-for-all", "vaultwarden");
+  const plain = run(["ls"]);
+  assert.match(plain.out, /provider mirror\(s\) hidden — --all/, `plain ls changed: ${plain.out}`);
+  const all = run(["ls", "--all"]);
+  assert.match(all.out, /mirror:mir-for-all/, `ls --all no longer lists mirrors: ${all.out}`);
+  assert.doesNotMatch(all.out, /hidden — --all/, "ls --all must not print the hidden count");
+});
+
+
 // Teardown and report come LAST. They used to sit here in the middle, so every
 fs.rmSync(TMP, { recursive: true, force: true });
 fs.rmSync(SAFE_CWD, { recursive: true, force: true });
