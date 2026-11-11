@@ -2,6 +2,17 @@
 
 All notable changes to the default uck bundle.
 
+## [Unreleased]
+
+### Documentation
+- **`uck`: `f uck new` and `f uck check` are now documented** (issue #4). They were
+  implemented and working but appeared only in the `f uck` usage string. `uck/SKILL.md`
+  gains a *The whole `f uck` surface* section covering all six subcommands, including
+  the flags the usage string itself omits (`check -a`, `push --repo`, `push --rebase`),
+  `check`'s default scope (git-clone buckets only) and exit codes, and `new`'s
+  default-bucket rule. `README.md` *Adding a uck* now starts with `f uck new` /
+  `f uck check`. Docs only — no behaviour change.
+
 ## [0.4.1]
 
 ### Added

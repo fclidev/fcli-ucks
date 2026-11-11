@@ -11,6 +11,40 @@ An **uck** is a directory with an `index.js` that exports `register(ctx)`. It is
 
 A command is needed a second time in a session (or is clearly repeated in scripts/CI) and `f help` has no covering uck. Make the uck, not a copy-paste.
 
+## The whole `f uck` surface
+
+Six subcommands. This is everything the uck implements — `f uck` with no argument
+prints the same list.
+
+```
+f uck new <name> [--bucket <b>] [--desc <d>]   scaffold a uck dir in the store
+f uck check [uck...] [--all|-a]                validate uck dirs against CONTRACT.md
+f uck repo add <name> <url> [--ref <ref>]      register a push target
+f uck repo ls                                  list push targets (+ their store ucks)
+f uck repo rm <name>                           unregister a target
+f uck push [<uck>...] [-r|--repo <name>]       push store ucks to a target
+    [--no-rebase]                              FF-only push (default: rebase)
+    [--rebase]                                 the default, stated explicitly
+```
+
+- **`new`** writes `<bucket>/<name>/index.js` + `package.json`
+  (`{"name":"<bucket>-<name>","type":"module"}`) and nothing else. `<name>` must
+  match `^[a-z0-9][a-z0-9-]*$`. With no `--bucket` it picks the **first push
+  target whose store dir is a git clone**; if there is no such bucket it errors
+  rather than guessing. `--desc` fills the scaffold's `desc`, else
+  `TODO: one line, ≤ 120 chars`.
+- **`check`** prints `ok`/`BAD`/`SKIP` per uck dir and a `f uck: N/M valid`
+  summary; exit is `1` if any dir is `BAD`, `0` otherwise. **Default scope is
+  buckets that are git clones** — your own work — so on a store of plain installs
+  it prints nothing and exits `1` with *"check found no uck dirs (use --all to
+  include non-git buckets)"*. Pass `--all` (or `-a`) for every bucket, or name
+  uck dirs to check just those. Separately from validity it prints
+  `f uck: WARNING <bucket>` for a clone holding work `f up` would reset; that is
+  a warning and does not change the exit code.
+- **`repo ls`** is also what a bare `f uck repo` prints.
+- **`push`** rebases by default (see *Where it lives*); `--no-rebase` is the
+  FF-only path. `-r` and `--repo` are the same flag.
+
 ## Where it lives (this machine)
 
 > **The bucket is a live git working tree, and `f up` resets it to origin.**
@@ -70,7 +104,8 @@ export default { register };
 
 1. `f uck check` — validates the ucks **and** warns if a bucket holds work that
    `f up` would reset away. (`f uck repo ls` also shows push targets/origins.)
-2. Add `myuck/index.js` in the bucket (`~/.f/ucks/kensand-fcli-ucks/myuck/`) or the repo checkout.
+2. Add `myuck/index.js` in the bucket (`~/.f/ucks/kensand-fcli-ucks/myuck/`) or the repo
+   checkout. `f uck new myuck` scaffolds both files for you and picks the bucket for you.
 3. Publish. Note: for NEW (untracked) uck dirs, `f uck push` only commits dirty TRACKED files, so it can say "nothing to do" — in that case commit directly in the bucket:
    ```
    git -C ~/.f/ucks/kensand-fcli-ucks add myuck && git -C ~/.f/ucks/kensand-fcli-ucks commit -m "add myuck uck" && git -C ~/.f/ucks/kensand-fcli-ucks push

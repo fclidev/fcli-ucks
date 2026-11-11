@@ -77,8 +77,10 @@ from `index.js`.
 
 ## Adding a uck
 
-1. Create `myuck/index.js` (plus any supporting files).
-2. Commit and push.
+1. `f uck new myuck` — scaffolds `myuck/index.js` + `myuck/package.json` in a store
+   bucket (or create the files by hand; the only requirement is `register(ctx)`).
+2. `f uck check myuck` — validates it against CONTRACT.md.
+3. Commit and push.
 
 Existing installs pick it up on `f up`.
 
