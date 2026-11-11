@@ -1970,7 +1970,30 @@ export function register(ctx) {
             let value = null;
             let src = `local:${name}`;
 
-            if (forceProvider) {
+            if (localOnly) {
+              // --local: the box only. This branch exists because `case "get"`
+              // used to hand-roll the resolution order a second time and simply
+              // never read `localOnly` — the flag was parsed, stored, and
+              // dropped, so `f creds get <name> --local` answered a provider
+              // mirror with exit 0 (fclidev/fcli-ucks#1). That is the worst
+              // possible failure for this flag: it is how an operator tells a
+              // real local secret apart from a provider mirror, and a silently
+              // ignored flag produces a confident wrong answer.
+              //
+              // `lookupCred(name, { localOnly: true })` is the single place that
+              // order lives, and with localOnly set it reads the box and returns
+              // { missing } without touching listProviders() or the mirror. The
+              // message matches `lookup --local`'s shape on purpose: the two
+              // commands must not disagree about a miss.
+              const r = await lookupCred(name, { localOnly: true });
+              if (r.locked) { process.stderr.write("f: creds locked\n"); process.exit(3); }
+              if (r.value == null) {
+                process.stderr.write(`f: no such cred: ${name}\n`);
+                process.exit(1);
+              }
+              value = r.value;
+              src = r.source;
+            } else if (forceProvider) {
               // --vault: skip local and mirror entirely, revalidate against the provider.
               const r = await resolveViaProvider(name, { getCred: (k) => rawGet(k, state), setMirror: (k, v, t) => setMirror(k, v, t, state), isFresh: () => false });
               if (r.none) { process.stderr.write(`f: ${r.note}\n`); process.exit(1); }
@@ -2428,7 +2451,8 @@ function usage(msg) {
       "  get <name> [--secrets]          print a cred (redacted without --secrets);\n" +
       "                                    on a local miss, consult credential\n" +
       "                                    providers and mirror the hit\n" +
-      "    --local                          never consult providers\n" +
+      "    --local                          box only: never consult providers, and\n" +
+      "                                     exit 1 on a local miss\n" +
       "    --vault                          skip local + mirror, revalidate with the\n" +
       "                                     provider now (refuses to serve a stale mirror)\n" +
       "    --source                         print provenance to stderr\n" +

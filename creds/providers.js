@@ -121,6 +121,41 @@ export function setDiscoveryOverride(list) {
   discovered = true;
 }
 let discoveryOverride = null;
+let fakeProvider = null;
+
+/**
+ * TEST-ONLY discovery seam: point F_CREDS_FAKE_PROVIDER at a module exporting a
+ * `credentialProvider` and it is the whole provider table for this process.
+ *
+ * This exists so a CLI-level test can drive `case "get"` with a provider that
+ * holds a name the local store does NOT — the only fixture that distinguishes
+ * `--local` from the ladder (fclidev/fcli-ucks#1). Without it the CLI child has
+ * to shell out to `f providers --dump`, which in a throwaway HOME runs a stale
+ * COPY of this tree (see creds/test/run-command.mjs), so the test would exercise
+ * code it is not asserting on.
+ *
+ * Deliberately narrow: it replaces discovery, it is read once per process, and
+ * it never registers anything for real. Unset (the normal case) and nothing here
+ * runs.
+ */
+function fakeProviderFromEnv() {
+  const entry = process.env.F_CREDS_FAKE_PROVIDER;
+  if (!entry) return null;
+  const url = pathToFileURL(entry).href;
+  return import(url).then((mod) => {
+    const p = mod?.credentialProvider;
+    if (!p || typeof p.resolve !== "function") return null;
+    return {
+      name: p.name ?? path.basename(entry, ".js"),
+      canWrite: p.canWrite === true,
+      resolve: (name) => p.resolve(String(name)),
+      has: typeof p.has === "function" ? (name) => p.has(String(name)) : undefined,
+      status: typeof p.status === "function" ? () => p.status() : async () => ({ ready: true }),
+      external: entry,
+      fake: true,
+    };
+  }).catch(() => null);
+}
 
 /* ------------------------------------------------------------------ config */
 
@@ -575,6 +610,13 @@ export function fromLiveDump(rows) {
  * Discovery runs once per process and its failure is remembered, not thrown.
  */
 export async function listProviders() {
+  if (process.env.F_CREDS_FAKE_PROVIDER && !discoveryOverride) {
+    if (!fakeProvider) fakeProvider = fakeProviderFromEnv();
+    const fake = await fakeProvider;
+    const out = [...localProviders.values()];
+    if (fake && !out.some((x) => x.name === fake.name)) out.push(fake);
+    return out;
+  }
   const out = [...localProviders.values()];
   if (discoveryOverride) {
     for (const p of discoveryOverride) if (!out.some((x) => x.name === p.name)) out.push(p);
