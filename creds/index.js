@@ -803,13 +803,55 @@ function looksLikePath(a) {
   return a.startsWith("/") || a.startsWith("~/") || a.startsWith("./") || a.startsWith("../");
 }
 
+/*
+ * Directory-ness must be resolved through a symlink, exactly as the providers uck
+ * does (see providers/index.js `isDir`, and uck/index.js which has always used
+ * statSync). `fs.readdirSync(..., { withFileTypes: true })` hands back `Dirent`s
+ * built from the readdir entry itself, so `Dirent.isDirectory()` is FALSE for a
+ * symlink even when the link points at a directory. Both gates below used it as
+ * their only directory test, so a uck tree staged as symlinks — a linked
+ * checkout, a store assembled out of per-uck links — came back with NOTHING and
+ * no error of any kind: `f creds pack <dir>/...` silently packed zero files, and
+ * the import list silently reported "no ucks" for a directory that plainly had
+ * some. `fs.statSync` follows the link, which is the question we actually care
+ * about: can this path be read as a directory. A broken link throws, and a throw
+ * means "not a directory".
+ *
+ * KNOWN REMAINING GAP, deliberately out of scope here: `walk()`'s sibling
+ * `ent.isFile()` has the same blindness — a symlinked FILE is still invisible to
+ * the walk. Directory-ness is the case that produced the silent zero, so that is
+ * what this converts; a symlinked file remains a named gap.
+ */
+function isDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Warn when a directory that HAS entries contributes nothing, so a silent zero is
+ * never the only signal — the same contract `warnEmptyBucket` gives the providers
+ * scan. Once per directory per process, so a repeated scan does not spam.
+ */
+const warnedDirs = new Set();
+function warnEmptyUckDir(dir, scanned) {
+  if (warnedDirs.has(dir)) return;
+  warnedDirs.add(dir);
+  process.stderr.write(
+    `f creds: warning: ${dir} yielded 0 ucks (scanned ${scanned} entr${scanned === 1 ? "y" : "ies"})\n`,
+  );
+}
+
 /** Recurse a dir into { file } targets, skipping node_modules/.git. */
 function walk(dir) {
   const out = [];
   for (const ent of fs.readdirSync(dir, { withFileTypes: true }).sort((x, y) => (x.name < y.name ? -1 : 1))) {
     if (ent.name === "node_modules" || ent.name === ".git") continue;
     const p = path.join(dir, ent.name);
-    if (ent.isDirectory()) out.push(...walk(p));
+    // Directory-ness is resolved through a symlink — see isDir().
+    if (isDir(p)) out.push(...walk(p));
     else if (ent.isFile()) out.push({ file: p });
   }
   return out;
@@ -824,9 +866,15 @@ function expandTargets(rest) {
     if (m) {
       const dir = path.resolve(m[1]);
       if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error(`not a directory: ${dir}`);
-      const ucks = fs.readdirSync(dir, { withFileTypes: true })
-        .filter((d) => d.isDirectory() && fs.existsSync(path.join(dir, d.name, "index.js")))
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      // Directory-ness is resolved through a symlink — see isDir(). The
+      // guard on the line above already asks the question this list forgot.
+      const ucks = entries
+        .filter((d) => isDir(path.join(dir, d.name)) && fs.existsSync(path.join(dir, d.name, "index.js")))
         .map((d) => d.name).sort();
+      // A directory that HAS entries but contributes nothing is the silent-zero
+      // case: say so on stderr before the throw ends the command.
+      if (!ucks.length) warnEmptyUckDir(dir, entries.length);
       if (!ucks.length) throw new Error(`no ucks (dirs with index.js) under ${dir}`);
       for (const u of ucks) targets.push(...walk(path.join(dir, u)));
       continue;
