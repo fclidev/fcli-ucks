@@ -40,6 +40,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const F = path.join(process.env.HOME ?? "", ".f");
 const CACHE = path.join(F, ".creds-cache.json");
@@ -150,7 +151,134 @@ export function providerCollisions() {
   return [...collisions];
 }
 
-function fromChildProcess(stdout) {
+/**
+ * The handle we hand a provider that asks for one: the sanctioned C3 read
+ * (`credsApi.rawCredRead`, CONTRACT.md §6.1) and nothing else.
+ *
+ * A provider probe must NOT get the full `credsApi`. `credsApi.resolveCred` runs
+ * the provider ladder, so a provider that called it from inside `status`/`resolve`
+ * would come straight back into `listProviders()` — the cycle this file already
+ * guards at the discovery edge. `rawCredRead` reads the store directly and never
+ * consults providers, so it cannot recurse.
+ */
+function probeHandle() {
+  return { version: 3, rawCredRead: (...a) => probeCredsRead(...a) };
+}
+
+/**
+ * Import a discovered provider's own module so it can be called in-process.
+ *
+ * `f providers --dump` gives us `{ name, entry, … }` — a path, not a module — so
+ * the only way to call the provider without a child is to import its entry.
+ * `import()` resolves `node_modules` from the importing module, not the target's
+ * directory, which is exactly CONTRACT.md P7; so we push the provider's own
+ * directory onto NODE_PATH for the duration of the import and restore it after.
+ * Any failure (no such file, a throw at module scope) returns null and the caller
+ * keeps the spawn path.
+ */
+async function importProvider(entry) {
+  if (typeof entry !== "string" || entry === "") return null;
+  const url = pathToFileURL(path.resolve(entry)).href;
+  const dir = path.dirname(path.resolve(entry));
+  const saved = process.env.NODE_PATH;
+  try {
+    process.env.NODE_PATH = saved ? `${dir}${path.delimiter}${saved}` : dir;
+    // node caches by resolved URL, so a second lookup is free.
+    const mod = await import(url);
+    const p = mod?.credentialProvider ?? mod?.default?.credentialProvider ?? mod?.default ?? mod;
+    return p && typeof p === "object" && typeof p.resolve === "function" ? p : null;
+  } catch {
+    return null;
+  } finally {
+    if (saved === undefined) delete process.env.NODE_PATH;
+    else process.env.NODE_PATH = saved;
+  }
+}
+
+/**
+ * Does the provider's own code read the trailing parameter?
+ *
+ * `fn.length` counts parameters **before the first default**, so PR #6's
+ * `status: (credsApi = null) => …` reports **0** and
+ * `resolve: async (name, credsApi = null) => …` reports **1** — identical to a
+ * provider written without any handle at all. Arity therefore cannot distinguish
+ * them, and a gate built on it silently keeps every real provider on the spawn
+ * path (measured: `status.length === 0` for the exact PR #6 declaration).
+ *
+ * So read the source instead. A defaulted parameter is unambiguous in text:
+ * `name =` inside the parameter list. This is a heuristic over the provider's own
+ * declared signature — it errs toward the spawn path (a provider whose source
+ * cannot be read, or whose params are all positional, keeps the old behaviour),
+ * which is the safe direction, and it is asserted directly by the test suite
+ * rather than inferred.
+ */
+const srcCache = new Map();
+function readsTrailingArg(fn, bare) {
+  if (typeof fn !== "function") return false;
+  if (fn.length > bare) return true;              // plain `(name, credsApi)` — no default
+  let src = srcCache.get(fn);
+  if (src === undefined) {
+    try {
+      src = Function.prototype.toString.call(fn);
+    } catch {
+      src = null;
+    }
+    srcCache.set(fn, src);
+  }
+  if (typeof src !== "string") return false;
+  const open = src.indexOf("(");
+  if (open < 0) return false;
+  // Scan for the matching close, ignoring nested parens (defaulted object args,
+  // nested arrow defaults) so we look at the parameter list and not the body.
+  let depth = 0, close = -1;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (c === "(") depth++;
+    else if (c === ")") { depth--; if (depth === 0) { close = i; break; } }
+  }
+  if (close < 0) return false;
+  const params = src.slice(open + 1, close);
+  // A parameter with a default value => the declaration carries the handle slot.
+  return /(^|[,({\s])[^()=]*=/.test(params);
+}
+
+/**
+ * Build the provider view of one `f providers --dump` row.
+ *
+ * Every method starts on the **child-process probe protocol** (CONTRACT.md P4):
+ * `node <entry> resolve <name> | has <name> | status`. That is the fallback and it
+ * is never removed — a provider whose module cannot be imported here, or that does
+ * not declare the handle, behaves exactly as it always has.
+ *
+ * On top of that, a provider that declares the trailing `credsApi` argument is
+ * offered an **in-process** call with the C3 handle. That is the point of this
+ * half: the dump row is a *path*, and a provider that reads the creds store needs
+ * a live handle, which a path cannot carry. Spawning it to ask "are you ready?"
+ * is what produced `not ready: no creds uck in this f tree` on a box with a
+ * perfectly good vault — the child had no handle to be given.
+ *
+ * `probeCredsRead` is the store read the handle wraps. It is injected by
+ * `creds/index.js` (the only place with a store to read); left unset, no handle
+ * exists and nothing but the spawn path can run.
+ */
+let probeCredsRead = null;
+
+/** Wire the store read that `probeHandle()` wraps. Called once from register(). */
+export function setProbeCredsRead(fn) {
+  probeCredsRead = typeof fn === "function" ? fn : null;
+}
+
+/** Test seam: the handle a handle-aware provider would receive, or null. */
+export function probeCredsHandle() {
+  return probeCredsRead ? probeHandle() : null;
+}
+
+/**
+ * Build provider objects from `f providers --dump` output. Exported for the test
+ * harness only, so the suite can exercise THE REAL builder on a crafted dump row
+ * instead of re-typing it (a re-typed copy tests the typing, not the code).
+ */
+export function fromChildProcess(stdout) {
   let obj;
   try {
     obj = JSON.parse(stdout);
@@ -162,17 +290,15 @@ function fromChildProcess(stdout) {
     // removed: there is no opt-out, and a uck that should not be probed
     // should not carry credentialProvider at all.
     .filter((p) => p && typeof p.name === "string")
-    .map((p) => ({
-      name: p.name,
-      canWrite: p.canWrite === true,   // advertised by the provider; gates `creds set` dual-write
-      mirrorTtlSec: typeof p.mirrorTtlSec === "number" ? p.mirrorTtlSec : undefined,
-      resolve: (name) => execFileSync(process.execPath, [p.entry, "resolve", String(name)], {
+    .map((p) => {
+      // Spawn fallbacks, verbatim. Kept reachable from every method below.
+      const spawnResolve = (name) => execFileSync(process.execPath, [p.entry, "resolve", String(name)], {
         encoding: "utf8",
         timeout: 90_000,
         maxBuffer: 32 << 20,
         stdio: ["ignore", "pipe", "pipe"],
-      }),
-      has: (name) => {
+      });
+      const spawnHas = (name) => {
         try {
           return execFileSync(process.execPath, [p.entry, "has", String(name)], {
             encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
@@ -180,17 +306,8 @@ function fromChildProcess(stdout) {
         } catch {
           return false;
         }
-      },
-      // Value on stdin: the same reason `set` refuses argv (any process can read a
-      // secret from `ps` for the command's lifetime). A provider that advertises
-      // canWrite handles `write <name>` on its probe CLI; otherwise this throws.
-      write: (name, value) => {
-        if (p.canWrite !== true) throw new Error(`provider '${p.name}' does not accept writes`);
-        return execFileSync(process.execPath, [p.entry, "write", String(name)], {
-          input: String(value), encoding: "utf8", timeout: 90_000, stdio: ["pipe", "pipe", "pipe"],
-        });
-      },
-      status: () => {
+      };
+      const spawnStatus = () => {
         try {
           return JSON.parse(execFileSync(process.execPath, [p.entry, "status"], {
             encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
@@ -198,9 +315,73 @@ function fromChildProcess(stdout) {
         } catch (e) {
           return { ready: false, note: "provider probe failed", hint: e.stderr?.toString?.().slice(0, 200) };
         }
-      },
-      external: p.entry,
-    }));
+      };
+
+      // In-process module, resolved lazily and once. `undefined` = not tried yet,
+      // `null` = tried and unavailable (so we never re-import on every lookup).
+      let mod;
+      const inProcess = async () => {
+        if (mod === undefined) mod = await importProvider(p.entry);
+        return mod;
+      };
+
+      return {
+        name: p.name,
+        canWrite: p.canWrite === true,   // advertised by the provider; gates `creds set` dual-write
+        mirrorTtlSec: typeof p.mirrorTtlSec === "number" ? p.mirrorTtlSec : undefined,
+        // A handle-aware provider is called here with the C3 handle; anything
+        // else (or an unimportable module) takes the spawn path unchanged.
+        resolve: async (name) => {
+          const m = await inProcess();
+          const handle = probeCredsRead ? probeHandle() : null;
+          if (m && handle && readsTrailingArg(m.resolve, 1)) return await m.resolve(String(name), handle);
+          return spawnResolve(name);
+        },
+        has: async (name) => {
+          const m = await inProcess();
+          const handle = probeCredsRead ? probeHandle() : null;
+          if (m && handle && readsTrailingArg(m.has, 1)) {
+            try {
+              return (await m.has(String(name), handle)) === true;
+            } catch {
+              return false; // pre-filter broke -> ask the real thing (askProviders' rule)
+            }
+          }
+          return spawnHas(name);
+        },
+        // Value on stdin: the same reason `set` refuses argv (any process can read a
+        // secret from `ps` for the command's lifetime). A provider that advertises
+        // canWrite handles `write <name>` on its probe CLI; otherwise this throws.
+        // Writes stay on the child: the brief scopes the handle to `status:` and
+        // `resolve:`, and a write is not a probe.
+        write: (name, value) => {
+          if (p.canWrite !== true) throw new Error(`provider '${p.name}' does not accept writes`);
+          return execFileSync(process.execPath, [p.entry, "write", String(name)], {
+            input: String(value), encoding: "utf8", timeout: 90_000, stdio: ["pipe", "pipe", "pipe"],
+          });
+        },
+        // THE ROW THIS IS ALL ABOUT. `f creds status` reads this, and the spawn
+        // form is what reported `not ready: no creds uck in this f tree` — the
+        // child had no store handle to ask with. With a handle-aware provider we
+        // call it here and hand it the C3 read.
+        status: async () => {
+          const m = await inProcess();
+          const handle = probeCredsRead ? probeHandle() : null;
+          if (m && handle && readsTrailingArg(m.status, 0)) {
+            try {
+              return await m.status(handle);
+            } catch (e) {
+              // P3: a provider that cannot answer must say so, not be rewritten.
+              // Report the failure the way the spawn path reports its own, and do
+              // NOT silently re-run the child (that would double the probe cost).
+              return { ready: false, note: "provider probe failed", hint: String(e?.message ?? e).slice(0, 200) };
+            }
+          }
+          return spawnStatus();
+        },
+        external: p.entry,
+      };
+    });
 }
 
 /**

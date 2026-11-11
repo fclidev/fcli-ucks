@@ -5,7 +5,7 @@
 // Provider table (see ./providers.js): every uck that exports a
 // `credentialProvider` is consulted when a name is missing from the box, and the
 // answer is mirrored back in as `mirror:<name>` with a ttl. Local always wins.
-import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryError, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource, clearMirrorSource } from "./providers.js";
+import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryError, setProbeCredsRead, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource, clearMirrorSource } from "./providers.js";
 
 import net from "node:net";
 import fs from "node:fs";
@@ -1442,6 +1442,14 @@ function toCredsError(name, e) {
 }
 
 export function register(ctx) {
+  // Hand the provider layer the one store read it is allowed to expose (C3's
+  // `rawCredRead`), so a discovered provider can be probed IN-PROCESS with a live
+  // handle instead of being spawned with none. Wiring it here — rather than
+  // importing rawCredRead into providers.js — keeps providers.js free of a
+  // back-import of its own consumer. Only `rawCredRead` crosses: `resolveCred`
+  // runs the provider ladder and would call straight back into listProviders().
+  // Paired with kensand/kensand-fcli-ucks#6, which makes the provider accept it.
+  setProbeCredsRead(rawCredRead);
   return {
     name: "creds",
     desc: "store credentials (scrypt+AES-GCM, daemon+socket, ttl); falls back to credential providers on a miss",
