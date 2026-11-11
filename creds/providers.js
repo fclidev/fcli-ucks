@@ -72,6 +72,50 @@ export function resetProviders() {
  * Without this, exercising the ladder offline means either shelling out to the
  * real `f` or mutating the real store — neither belongs in a unit test.
  */
+/**
+ * The providers uck object, handed over by `setProvidersUck()`.
+ *
+ * creds never imports it: N4 forbids reaching out of the uck directory, and a
+ * static import would also make the creds uck depend on load order. The
+ * registry is the one sanctioned peer accessor (N20), and it exists only at run
+ * time (N19/G11), which is why this is injected rather than imported.
+ */
+let providersUckRef = null;
+
+/**
+ * Point discovery at the providers uck's in-process view. Called from creds'
+ * run() with `ctx.registry.providers`. Null/absent is normal — the test driver
+ * and any caller that passes no ctx — and simply leaves the spawn path in place.
+ */
+export function setProvidersUck(obj) {
+  providersUckRef = obj && typeof obj === "object" ? obj : null;
+}
+
+/** Test seam: the peer object discovery would consult, or null. */
+export function providersUck() {
+  return providersUckRef;
+}
+
+/**
+ * Ask the providers uck for its providers IN-PROCESS, live objects attached.
+ *
+ * Returns the rows, or null to mean "ask the child instead". Every failure mode
+ * returns null rather than throwing: a peer that is absent, is not the real uck
+ * object, does not export the accessor, or throws inside discovery must leave
+ * the spawn path exactly as it was. Discovery is not allowed to become less
+ * reliable in order to become cheaper.
+ */
+async function discoverViaPeer() {
+  const peer = providersUckRef;
+  if (!peer || typeof peer.discoverInProcess !== "function") return null;
+  try {
+    const rows = await peer.discoverInProcess();
+    return Array.isArray(rows) ? rows : null;
+  } catch {
+    return null;
+  }
+}
+
 export function setDiscoveryOverride(list) {
   discoveryOverride = Array.isArray(list) ? list : null;
   discovered = true;
@@ -161,8 +205,38 @@ export function providerCollisions() {
  * guards at the discovery edge. `rawCredRead` reads the store directly and never
  * consults providers, so it cannot recurse.
  */
+async function probeHandleRead(names, ...rest) {
+  const res = await probeCredsRead(names, ...rest);
+  if (!res || typeof res !== "object") return res;
+  // The store's own answer shape is `{ token, reason }` (CONTRACT.md C3 + §7.2:
+  // reason ∈ locked|missing|provider|no-store|timeout), and that is what every
+  // other credsApi consumer reads. A probe provider, however, is written against
+  // the shape `f creds get` prints and `resolveCred` returns — `{ value, error }`
+  // — because that is the shape the spawn path handed it (`f creds get` on
+  // stdout, or its `no such cred` stderr). Handing a provider the raw store
+  // shape is what made the in-process read useless even when the handle was
+  // threaded correctly: a real hit came back as `{ token: <44 chars> }`, the
+  // provider looked at `res.value`, saw undefined, and spawned anyway. Measured
+  // on a live vault: 5 such spawns per `f creds status`.
+  //
+  // So translate at the boundary, and keep BOTH shapes on the way out: `token`
+  // and `reason` for anything written against C3, `value` and `error` for the
+  // provider-facing shape. Nothing is dropped, so this cannot break a consumer
+  // that is already reading the store shape.
+  const out = { ...res };
+  if (out.value === undefined) out.value = res.token ?? null;
+  if (out.error === undefined) {
+    // `missing` is the store's word for "not in the box"; the spawn path said
+    // `no such cred: <name>` and providers match on that phrase, so say it too.
+    out.error = res.reason === "missing"
+      ? `no such cred: ${res.host ?? (Array.isArray(names) ? names[0] : names)}`
+      : (res.reason ?? null);
+  }
+  return out;
+}
+
 function probeHandle() {
-  return { version: 3, rawCredRead: (...a) => probeCredsRead(...a) };
+  return { version: 3, rawCredRead: probeHandleRead };
 }
 
 /**
@@ -274,6 +348,45 @@ export function probeCredsHandle() {
 }
 
 /**
+ * The three child-process probe commands (CONTRACT.md P4), hoisted so BOTH
+ * builders — `fromChildProcess()` (path from stdout) and `fromLiveDump()` (live
+ * object) — fall back to the identical command line. Bodies are verbatim from
+ * the original closures; only their home moved. A row's `entry` is the only
+ * input, so a live-object provider degrades to exactly the child the old code
+ * would have run.
+ */
+function spawnResolveOf(row) {
+  return (name) => execFileSync(process.execPath, [row.entry, "resolve", String(name)], {
+    encoding: "utf8",
+    timeout: 90_000,
+    maxBuffer: 32 << 20,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+function spawnHasOf(row) {
+  return (name) => {
+    try {
+      return execFileSync(process.execPath, [row.entry, "has", String(name)], {
+        encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
+      }).trim() === "yes";
+    } catch {
+      return false;
+    }
+  };
+}
+function spawnStatusOf(row) {
+  return () => {
+    try {
+      return JSON.parse(execFileSync(process.execPath, [row.entry, "status"], {
+        encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
+      }));
+    } catch (e) {
+      return { ready: false, note: "provider probe failed", hint: e.stderr?.toString?.().slice(0, 200) };
+    }
+  };
+}
+
+/**
  * Build provider objects from `f providers --dump` output. Exported for the test
  * harness only, so the suite can exercise THE REAL builder on a crafted dump row
  * instead of re-typing it (a re-typed copy tests the typing, not the code).
@@ -291,31 +404,10 @@ export function fromChildProcess(stdout) {
     // should not carry credentialProvider at all.
     .filter((p) => p && typeof p.name === "string")
     .map((p) => {
-      // Spawn fallbacks, verbatim. Kept reachable from every method below.
-      const spawnResolve = (name) => execFileSync(process.execPath, [p.entry, "resolve", String(name)], {
-        encoding: "utf8",
-        timeout: 90_000,
-        maxBuffer: 32 << 20,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      const spawnHas = (name) => {
-        try {
-          return execFileSync(process.execPath, [p.entry, "has", String(name)], {
-            encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
-          }).trim() === "yes";
-        } catch {
-          return false;
-        }
-      };
-      const spawnStatus = () => {
-        try {
-          return JSON.parse(execFileSync(process.execPath, [p.entry, "status"], {
-            encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
-          }));
-        } catch (e) {
-          return { ready: false, note: "provider probe failed", hint: e.stderr?.toString?.().slice(0, 200) };
-        }
-      };
+      // Spawn fallbacks: the hoisted helpers below, bound to this row's entry.
+      const spawnResolve = spawnResolveOf(p);
+      const spawnHas = spawnHasOf(p);
+      const spawnStatus = spawnStatusOf(p);
 
       // In-process module, resolved lazily and once. `undefined` = not tried yet,
       // `null` = tried and unavailable (so we never re-import on every lookup).
@@ -385,6 +477,98 @@ export function fromChildProcess(stdout) {
 }
 
 /**
+ * Build a provider from an IN-PROCESS dump row — one that carries `provider`,
+ * the live `credentialProvider` object the providers uck imported in this
+ * process.
+ *
+ * This is the fix. `fromChildProcess()` above receives only the dump's stdout,
+ * so the best it can do is import the row's PATH — which yields a SECOND
+ * instance of the provider module. The handle then goes to an instance nobody
+ * prints from, the CLI shows the child's answer, and the spawn is paid anyway.
+ * Here the object IS the one whose `status()` produced the row, so the
+ * in-process result is the printed result and no child runs at all.
+ *
+ * Everything that is not a probe is deliberately unchanged: `write` still execs
+ * the entry (a write is not a probe), and the fallbacks are the same hoisted
+ * spawn helpers `fromChildProcess()` uses, bound to the same `entry`. A row
+ * without a usable live object is handed to `fromChildProcess()` verbatim, so a
+ * provider the peer could not import behaves exactly as it always has.
+ */
+export function fromLiveDump(rows) {
+  if (!Array.isArray(rows)) return [];
+  const out = [];
+  for (const row of rows) {
+    if (!row || typeof row.name !== "string") continue;
+    const p = row.provider;
+    if (!p || typeof p !== "object" || typeof p.resolve !== "function") {
+      // No live object: the path builder and its spawn fallback handle this
+      // exactly as before. Going through the real builder (rather than re-typing
+      // its spawn code) keeps the two paths from drifting.
+      out.push(...fromChildProcess(JSON.stringify([row])));
+      continue;
+    }
+    const handle = () => (probeCredsRead ? probeHandle() : null);
+    const spawnResolve = spawnResolveOf(row);
+    const spawnHas = spawnHasOf(row);
+    const spawnStatus = spawnStatusOf(row);
+    out.push({
+      name: p.name ?? row.name,
+      canWrite: row.canWrite === true,
+      mirrorTtlSec: typeof row.mirrorTtlSec === "number" ? row.mirrorTtlSec : undefined,
+      // Same rule as fromChildProcess(): the handle is the LAST OPTIONAL
+      // argument, so a provider written to the bare P4 shape is called as-is,
+      // and detection stays on the parameter-list text (never fn.length).
+      resolve: async (name) => {
+        const h = handle();
+        if (h && readsTrailingArg(p.resolve, 1)) return await p.resolve(String(name), h);
+        return spawnResolve(name);
+      },
+      has: async (name) => {
+        const h = handle();
+        if (typeof p.has === "function" && h && readsTrailingArg(p.has, 1)) {
+          try {
+            return (await p.has(String(name), h)) === true;
+          } catch {
+            return false; // pre-filter broke -> ask the real thing (askProviders' rule)
+          }
+        }
+        return spawnHas(name);
+      },
+      // Writes stay on the child even here: the handle is a probe credential and
+      // a write is not a probe. Identical rule, identical command, to
+      // fromChildProcess().write().
+      write: (name, value) => {
+        if (row.canWrite !== true) throw new Error(`provider '${row.name}' does not accept writes`);
+        return execFileSync(process.execPath, [row.entry, "write", String(name)], {
+          input: String(value), encoding: "utf8", timeout: 90_000, stdio: ["pipe", "pipe", "pipe"],
+        });
+      },
+      // THE ROW THIS IS ALL ABOUT — `f creds status` prints this, and it now
+      // comes from the same instance that produced the dump row.
+      status: async () => {
+        const h = handle();
+        if (typeof p.status === "function" && h && readsTrailingArg(p.status, 0)) {
+          try {
+            return await p.status(h);
+          } catch (e) {
+            // P3: a provider that cannot answer must say so, not be rewritten.
+            // Report it the way the spawn path reports its own failure, and do
+            // NOT silently re-run the child (that would double the probe cost).
+            return { ready: false, note: "provider probe failed", hint: String(e?.message ?? e).slice(0, 200) };
+          }
+        }
+        return spawnStatus();
+      },
+      external: row.entry,
+      // Diagnostic: which builder produced this provider. "Same instance" is
+      // otherwise invisible from the outside, so the suite asserts on this.
+      live: true,
+    });
+  }
+  return out;
+}
+
+/**
  * Every registered provider: this process's own, plus anything discovered from
  * `f providers --dump` (each uck's exported `credentialProvider`, evaluated in a
  * child process so a provider never has to be imported into the creds hot path).
@@ -410,6 +594,21 @@ export async function listProviders() {
   if (process.env.F_CREDS_NO_PROVIDER === "1") return out;
   if (!discovered) {
     discovered = true;
+    // THE IN-PROCESS SHORTCUT. `f` loads every uck in ONE process, so the
+    // providers uck is already here and has already imported every provider.
+    // Asking it directly replaces the `f providers --dump` child entirely, and
+    // — the part that actually matters — hands back the provider OBJECTS, so the
+    // instance creds probes is the instance whose `status()` produced the row.
+    // The dump's stdout could only ever carry a path, and a path cannot carry a
+    // store handle; that is why the handle used to be built, offered, and thrown
+    // away. Null (no peer, foreign ctx, peer error) falls through to the spawn.
+    const live = await discoverViaPeer();
+    if (live) {
+      for (const p of fromLiveDump(live)) {
+        if (!out.some((x) => x.name === p.name)) out.push(p);
+      }
+      return out;
+    }
     try {
       const stdout = execFileSync("f", ["providers", "--dump"], {
         encoding: "utf8", timeout: 25_000, stdio: ["ignore", "pipe", "pipe"],

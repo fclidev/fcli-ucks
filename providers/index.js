@@ -72,7 +72,17 @@ export function uckDirs() {
  * Import every uck and collect its `credentialProvider` export.
  * Import failures are skipped with a note — a broken uck must not blind creds.
  */
+/**
+ * Live `credentialProvider` objects by entry path, filled by the most recent
+ * `collect()`. `found` is deliberately plain serialisable data (it is what
+ * `--dump` prints and what `f providers` renders), so the objects themselves
+ * ride alongside it here rather than inside it — `discoverInProcess()` below is
+ * the only reader, and it hands them to the creds uck through the registry.
+ */
+const providerByEntry = new Map();
+
 export async function collect({ verbose } = {}) {
+  providerByEntry.clear();
   const found = [];
   const skipped = [];
   for (const u of uckDirs()) {
@@ -101,6 +111,7 @@ export async function collect({ verbose } = {}) {
       canWrite: p.canWrite === true,
       mirrorTtlSec: typeof p.mirrorTtlSec === "number" ? p.mirrorTtlSec : undefined,
     });
+    providerByEntry.set(u.entry, p);
   }
   if (verbose) for (const s of skipped) process.stderr.write(`f providers: skip ${s.name}: ${s.reason}\n`);
   return { found, skipped };
@@ -146,10 +157,47 @@ export async function checkProbes(found) {
   return found;
 }
 
+/**
+ * Discovery, in-process, with the LIVE provider objects attached.
+ *
+ * `f` loads every uck in ONE process (dist/index.js: `loadStoreUcks` imports
+ * each uck's index.js, then dispatches with `ctx.registry` holding them all).
+ * So when `f creds` runs discovery it is standing in the same process as this
+ * uck — and this uck has already imported every provider. Until now the two
+ * halves talked only through the dump's stdout, which is a list of PATHS, and a
+ * path cannot carry a store handle. creds re-imported each path, got a SECOND
+ * instance of the provider module, handed the handle to that one, and printed
+ * the status line the CHILD had produced: the handle was built, offered, and
+ * thrown away, and the nested `f creds status` was paid anyway.
+ *
+ * Returning `collect()`'s rows plus the `credentialProvider` object itself means
+ * creds probes the very instance whose `status()` produced the row, so the
+ * in-process answer IS the printed answer and the dump spawn disappears.
+ *
+ * `checkProbes` is skipped deliberately: it spawns `node <entry> status` for
+ * every provider, which is exactly the child this call exists to avoid, and its
+ * result (`probe`) is display-only for `f providers`. A caller that wants the
+ * self-test calls `collect()` + `checkProbes()` itself, as the CLI does.
+ *
+ * Returns null when discovery cannot be answered here (no uck store), so the
+ * caller falls back to the spawn path unchanged.
+ */
+export async function discoverInProcess() {
+  if (!buckets().length) return null;
+  const { found } = await collect({ verbose: false });
+  if (!found.length) return [];
+  return found.map((row) => ({ ...row, provider: providerByEntry.get(row.entry) ?? null }));
+}
+
 export function register(_ctx) {
   return {
     name: "providers",
     desc: "list credential providers registered with f creds",
+    // Peer API. `ctx.registry` holds THIS object, not the module namespace
+    // (f core: `newUcks = mod.register(ctx)`, then `ucks[u.name] = u`), so a
+    // module-level `export function` is invisible to a peer — the accessor has
+    // to be a property here, exactly like `credsApi` and `skillsApi`.
+    discoverInProcess,
     run: (_argv, args) => {
       const a = args._ ?? [];
       const dump = a.includes("--dump") || a.includes("--json");

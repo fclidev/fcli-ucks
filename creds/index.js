@@ -5,7 +5,7 @@
 // Provider table (see ./providers.js): every uck that exports a
 // `credentialProvider` is consulted when a name is missing from the box, and the
 // answer is mirrored back in as `mirror:<name>` with a ttl. Local always wins.
-import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryError, setProbeCredsRead, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource, clearMirrorSource } from "./providers.js";
+import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryError, setProbeCredsRead, setProvidersUck, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource, clearMirrorSource } from "./providers.js";
 
 import net from "node:net";
 import fs from "node:fs";
@@ -1634,7 +1634,16 @@ export function register(ctx) {
        *  what `f creds status` says about a permanent session. */
       describeStatus: () => describeUnlock(unlockedState()),
     },
-    run: (argv, args) => {
+    run: (argv, args, ctx) => {
+      // Hand discovery the providers uck object, so it can ask for providers
+      // IN-PROCESS and get the provider OBJECTS back rather than the dump's
+      // paths. `ctx.registry` is the one sanctioned peer accessor (CONTRACT.md
+      // N20) and it exists only at run time (N19/G11), which is why this is
+      // injected here instead of imported — N4 also forbids creds reaching out
+      // of its own directory. Absent ctx (the test driver, or any uck calling
+      // run() directly) leaves the spawn path exactly as it was.
+      const registry = ctx && ctx.registry;
+      setProvidersUck(registry && typeof registry === "object" ? registry.providers ?? null : null);
       const pos = [];
       // undefined = "the operator did not ask for a ttl". It used to be
       // initialised to DEFAULT_TTL here, which made every downstream
