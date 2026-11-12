@@ -29,7 +29,6 @@ services, no external binaries.
 | `unlock [--ttl <dur>]` / `lock [--purge]` | open or zeroise the in-memory key |
 | `unlock --permanent [--key-file <p>]` | never-expiring unlock driven by a 0600 key file; restarts itself after a reboot |
 | `status` | locked/unlocked, time left, providers and their readiness |
-| `import <file>` / `export` | move entries between stores |
 | `files pack/unpack/ls/rm` | whole files in the same box (`file:<abs path>`) — there is no `list` |
 | `request <name> [--timeout s]` | block until the cred is set elsewhere, then print it |
 | `waiters` | list open waiting requests from other terminals |
