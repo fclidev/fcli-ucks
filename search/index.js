@@ -15,6 +15,10 @@
  *    precisely because they must answer before any uck exists.
  */
 
+// Self-registering SKILL.md needs the module dir (CONTRACT §S2 expression).
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 // Search output caps descriptions far harder than `f help` ever did (core's
 // DESC_MAX is 120). Search returns several lines at once and each one pays for
 // its own description, so per-line cost is what the model actually feels:
@@ -118,6 +122,9 @@ export function register(_ctx) {
   return {
     name: "search",
     desc: "rank ucks against a query (name, then description)",
+    // Self-register the shipped SKILL.md — `f skills ls` builds from each uck's
+    // exported `skills`, so an unexported doc stays invisible.
+    skills: [{ name: "f-search", path: join(dirname(fileURLToPath(import.meta.url)), "SKILL.md") }],
     // No .help export: bare `f search` falls through to run(), which prints
     // clean usage without the G8 interceptor's `search  rank ucks…` header.
     run: (argv, args, ctx) => {

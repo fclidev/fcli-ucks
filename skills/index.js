@@ -257,6 +257,9 @@ export function register(ctx) {
     // (f-creds lives with the creds uck; f-uck-creation with the uck uck.)
     skills: [
       { name: "f-cli", path: join(here, "f-cli.md") },
+      // This uck's own doc, which shipped unlisted for its whole life, so
+      // `f skills ls` could never surface how `f skills` itself works.
+      { name: "f-skills", path: join(here, "SKILL.md") },
     ],
     skillsApi,
     run: (argv, args, ctx) => {

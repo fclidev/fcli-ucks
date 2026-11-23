@@ -15,6 +15,7 @@
     "cli"
   ],
   "files": [
+    "SKILL.md",
     "index.js",
     "uckmain.js"
   ],

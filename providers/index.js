@@ -25,7 +25,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 
 let F = path.join(process.env.HOME ?? "", ".f");
 
@@ -260,6 +260,9 @@ export function register(_ctx) {
   return {
     name: "providers",
     desc: "list credential providers registered with f creds",
+    // Self-register the shipped SKILL.md (§S2 module-dir expression): shipping it
+    // in `files` is not enough — nothing lists a doc that no uck exports.
+    skills: [{ name: "f-providers", path: path.join(path.dirname(fileURLToPath(import.meta.url)), "SKILL.md") }],
     // Peer API. `ctx.registry` holds THIS object, not the module namespace
     // (f core: `newUcks = mod.register(ctx)`, then `ucks[u.name] = u`), so a
     // module-level `export function` is invisible to a peer — the accessor has

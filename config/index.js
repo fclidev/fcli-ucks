@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from "node:fs";
 import { join, dirname, resolve, isAbsolute, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const { JSONPath } = require("jsonpath-plus");
@@ -319,6 +320,10 @@ export function register(ctx) {
   return {
     name: "config",
     desc: "edit f.config.json via JSONPath (get/set/add/remove/list)",
+    // Self-register the shipped SKILL.md (§S2 module-dir expression): the skills
+    // uck only lists a doc a uck exports in `skills`, so `files` alone keeps it
+    // out of `f skills ls`.
+    skills: [{ name: "f-config", path: join(dirname(fileURLToPath(import.meta.url)), "SKILL.md") }],
     // Programmatic entry: other ucks can do require("@fcli/config").configApi
     configApi,
     run: (argv, args) => {
