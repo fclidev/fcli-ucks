@@ -1,0 +1,226 @@
+name: publish-per-uck
+
+# DRAFT — not wired to anything yet. This publishes ONE npm package PER UCK
+# (`uck-config`, `uck-creds`, …) instead of the single `@fcli.dev/ucks` bundle
+# that publish.yml ships. Both can coexist: keep publish.yml for the bundle, or
+# retire it once the per-uck packages have real users.
+#
+# WHY A MATRIX AND NOT ONE WORKFLOW PER UCK
+# -----------------------------------------
+# npm's trusted publishing is registered PER PACKAGE: one trusted publisher
+# grants exactly one package. So N ucks need N publishers on npmjs.com, each
+# pointing at the SAME repo + the SAME environment name (`npm` here). That is
+# the manual setup kenny does by hand — this file only has to satisfy it.
+# See https://docs.npmjs.com/trusted-publishers
+#
+# ONE-TIME npm-side SETUP (repeat per package, ~7 clicks):
+#   npmjs.com -> Access Tokens -> Trusted Publishers -> "Add trusted publisher"
+#     Provider:      GitHub
+#     GitHub owner:  fclidev
+#     Repository:    fcli-ucks
+#     Environment:   npm          <- MUST equal `environment:` below
+#     Package:       uck-config   <- one package per publisher
+#   Then approve the pending request in the npm UI.
+#
+# GitHub-side: Settings -> Environments -> create `npm`. Optionally add a
+# required-reviewer rule there: it turns every publish into a manual approval,
+# which is the cheapest guard against a tag that should not have been pushed.
+#
+# PUBLICATION IS IRREVERSIBLE, AND THAT IS A DESIGN CONSTRAINT
+# ------------------------------------------------------------
+# npm refuses to delete a package's first version inside 24h, and `npm
+# unpublish --force` has been observed here to print a removal line while the
+# package stayed installable. Version numbers are never reusable. So the gate
+# below is intentionally harsh: it runs the SAME install assertion that found
+# two silently-broken packages on this branch, and it will not publish anything
+# it cannot prove installs from a clean store.
+#
+# https://docs.npmjs.com/trusted-publishers
+# https://github.blog/changelog/2025-07-31/npm-trusted-publishing-with-oidc-is-generally-available/
+
+on:
+  push:
+    # `v*` is deliberately NOT a trigger here: publish.yml already publishes the
+    # bundle on `v*`, and one tag firing two publish workflows is how you get an
+    # unintended release. Use an explicit per-uck tag instead:
+    #     uck-config@0.4.2      uck-creds@0.4.2
+    # The tag name is parsed and verified below; nothing is published that does
+    # not match its own package.json.
+    tags:
+      - "uck-*@*"
+
+# id-token: write lets GitHub Actions mint the OIDC token npm verifies.
+# No NPM_TOKEN secret is needed, stored, or readable here.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Decide WHICH package this tag names, and refuse anything ambiguous.
+  # ---------------------------------------------------------------------------
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      uck: ${{ steps.pick.outputs.uck }}
+      pkg: ${{ steps.pick.outputs.pkg }}
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse and validate the tag
+        id: pick
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # Tag shape: uck-<name>@<semver>   e.g.  uck-config@0.4.2
+          uck="${tag%@*}"          # -> uck-config
+          version="${tag#*@}"      # -> 0.4.2
+          if [ "$uck" = "$tag" ] || [ "$version" = "$tag" ]; then
+            echo "::error::tag '$tag' is not '<pkg-name>@<version>'"
+            exit 1
+          fi
+          dir="${uck#uck-}"        # -> config (package name is prefixed, dir is not)
+          if [ ! -f "$dir/package.json" ]; then
+            echo "::error::tag names '$uck' but there is no $dir/package.json in this repo"
+            echo "::error::refusing to guess. Is the tag misspelled, or is this uck unsplit?"
+            exit 1
+          fi
+          pkg="$(node -p "require('./$dir/package.json').name")"
+          pkg_version="$(node -p "require('./$dir/package.json').version")"
+          echo "tag:            $tag"
+          echo "uck dir:        $dir"
+          echo "npm package:    $pkg"
+          echo "version (tag):  $version"
+          echo "version (pkg):  $pkg_version"
+          # Fail fast, exactly like publish.yml: never publish a version that
+          # disagrees with what is committed.
+          if [ "$version" != "$pkg_version" ]; then
+            echo "::error::tag says $version but $dir/package.json says $pkg_version"
+            exit 1
+          fi
+          # The '@' in a tag is legal git but hostile to npm: `npm publish` takes
+          # a SPEC, and `foo@1.2.3` is "package foo at version". A tag that would
+          # resolve to a different npm name+version than the package directory is
+          # exactly how a publish lands somewhere you did not intend, so refuse
+          # to rely on any npm name inference here: publish from inside $dir with
+          # a bare `npm publish`, and pin the identity by reading it back from
+          # the packed tarball (step 'verify'), not from the tag string.
+          if printf '%s' "$pkg" | grep -q '@'; then
+            echo "::error::package name '$pkg' is scoped; this workflow's tag scheme (uck-<dir>@<ver>) and the unscoped publisher setup do not support scopes yet."
+            exit 1
+          fi
+          if [ "$pkg" != "uck-$dir" ]; then
+            echo "::warning::package name '$pkg' does not follow the 'uck-<dir>' convention implied by the tag; publishing '$pkg' because package.json is authoritative."
+          fi
+          echo "uck=$dir" >> "$GITHUB_OUTPUT"
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. THE GATE. Runs the repo's own install assertion, not a re-implementation.
+  #    It packs every uck, installs the tarballs into a throwaway store, imports
+  #    each INSTALLED index.js, calls register(), and asserts:
+  #      - the registered count equals the uck count
+  #      - every runtime asset the code names (join(here,"x.md"),
+  #        spawn(join(__dirname,"daemon.js"))) is ACTUALLY in the tarball
+  #    That closure check exists because 7/7 registered green while `skills`
+  #    shipped neither .md file it reads and `creds` omitted the daemon it
+  #    spawns. `files` is a whitelist: omissions ship silently.
+  # ---------------------------------------------------------------------------
+  verify:
+    needs: select
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Node 22.14+ / npm 11.5.1+ are REQUIRED for npm OIDC trusted
+          # publishing. Node 20 ships npm 10, which cannot do OIDC publish and
+          # fails with a misleading E404.
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dev deps (scripts need nothing beyond node builtins)
+        run: npm ci
+
+      - name: Assert per-uck manifests match reality
+        # Dry-run by default: writes nothing, exits non-zero if a uck's
+        # package.json disagrees with what its code actually imports.
+        run: node scripts/peruck.mjs
+
+      - name: Assert every uck installs AND registers from a clean store
+        run: node scripts/verify-install.mjs
+
+      - name: Assert the tarball we are about to ship is the one we verified
+        run: |
+          set -euo pipefail
+          cd "${{ needs.select.outputs.uck }}"
+          npm pack --pack-destination "$RUNNER_TEMP" | tail -1
+          tgz="$(ls "$RUNNER_TEMP"/*.tgz | head -1)"
+          echo "--- contents of $tgz ---"
+          tar -tzf "$tgz" | sed 's/^/  /'
+          # Cheap, explicit restatement of the two invariants, so a future
+          # refactor of verify-install.mjs cannot quietly drop them for the
+          # package this tag actually names.
+          tar -tzf "$tgz" | grep -q '^package/index\.js$' \
+            || { echo "::error::$tgz has no package/index.js — nothing would register"; exit 1; }
+          tar -tzf "$tgz" | grep -q '^package/package\.json$' \
+            || { echo "::error::$tgz has no package.json — npm would reject it"; exit 1; }
+
+  # ---------------------------------------------------------------------------
+  # 3. PUBLISH. Single job, single package, so the OIDC audience maps to exactly
+  #    one trusted publisher. A matrix that published many packages from one
+  #    environment token is possible but makes an accidental multi-publish one
+  #    tag away; per-tag publishing keeps every release a deliberate act.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [select, verify]
+    runs-on: ubuntu-latest
+    # Must equal the "Environment" chosen on npm for THIS package's trusted
+    # publisher. Also gives an optional human approval gate.
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: "Publish ${{ needs.select.outputs.pkg }} (trusted publishing / OIDC)"
+        run: |
+          set -euo pipefail
+          cd "${{ needs.select.outputs.uck }}"
+          # No NODE_AUTH_TOKEN: npm verifies the OIDC token (id-token: write)
+          # against the trusted publisher registered for this repo + the `npm`
+          # environment + THIS package name.
+          npm publish --access public
+
+      # Verify the EFFECTIVE result from the registry, not from npm's stdout.
+      # A `+ <name>` line does not reliably echo what was published (npm rewrites
+      # scopes), and `npm view` can read a local cache miss as "not found".
+      # Fetching the package doc over HTTPS is the existence proof; the tarball
+      # HEAD proves it is actually installable, not merely registered.
+      - name: Confirm what the registry actually has
+        run: |
+          set -euo pipefail
+          pkg="${{ needs.select.outputs.pkg }}"
+          ver="${{ needs.select.outputs.version }}"
+          enc="https://registry.npmjs.org/$(printf '%s' "$pkg" | sed 's#/#%2f#')"
+          sleep 5
+          doc="$(curl -sS -m 30 "$enc")"
+          got="$(printf '%s' "$doc" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s)["dist-tags"]?.latest ?? "")}catch{console.log("")}})')"
+          echo "registry latest for $pkg: ${got:-<none>}"
+          if [ "$got" != "$ver" ]; then
+            echo "::error::expected $pkg@$ver to be latest; registry says '${got:-<none>}'. Check the trusted publisher entry and the package name."
+            exit 1
+          fi
+          # Also prove the tarball is fetchable — a doc can exist while the
+          # artifact does not.
+          name_flat="$(printf '%s' "$pkg" | sed 's#^@##; s#/#-#')"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -m 30 \
+            "https://registry.npmjs.org/$pkg/-/$name_flat-$ver.tgz")"
+          echo "tarball HTTP $code"
+          [ "$code" = "200" ] || { echo "::error::$pkg@$ver tarball not downloadable (HTTP $code)"; exit 1; }

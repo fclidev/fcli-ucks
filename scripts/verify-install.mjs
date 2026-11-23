@@ -98,7 +98,18 @@ try {
     wanted.delete("package.json");
     if (!wanted.size) continue;
     // What the tarball actually contains, relative to the package root.
-    const listed = execFileSync("tar", ["-tzf", path.join(packDir, `${pkg.name}-${pkg.version}.tgz`)], { encoding: "utf8" })
+    // npm's packed filename STRIPS the scope and joins it with the name:
+    // `@a/b-c`@1.2.3 -> `a-b-c-1.2.3.tgz` (measured, npm 11). Naively using
+    // `${pkg.name}-${pkg.version}.tgz` would look for `@a/b-c-1.2.3.tgz`, throw
+    // ENOENT, and read as "asset closure missing" for a perfectly good package.
+    // Derive the real tarball name from the packDir listing instead of guessing.
+    const tgz = readdirSync(packDir).find((f) => {
+      const base = f.replace(/\.tgz$/, "");
+      const flat = `${pkg.name.replace(/^@/, "").replace("/", "-")}-${pkg.version}`;
+      return base === flat;
+    });
+    if (!tgz) throw new Error(`${name}: no tarball for ${pkg.name}@${pkg.version} in packDir (found: ${readdirSync(packDir).join(", ")})`);
+    const listed = execFileSync("tar", ["-tzf", path.join(packDir, tgz)], { encoding: "utf8" })
       .split("\n").filter(Boolean).map((l) => l.replace(/^package\//, ""));
     for (const w of [...wanted].sort()) {
       if (!listed.includes(w)) assetProblems.push(`${name}: code reads ./${w} but the tarball does not ship it`);
