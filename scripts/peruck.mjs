@@ -221,6 +221,16 @@ for (const name of uckDirs) {
     // Never invent a license. The repo is GPL-3.0-only and only the operator can
     // relicense a uck; inheriting the bundle's license is the safe default.
     license: cur.license ?? pkg.license,
+    // Trusted publishing (OIDC) requires repository.url to match the GitHub repo
+    // exactly - npm's own troubleshooting says a mismatch is rejected at publish
+    // time, and the per-uck manifests inherited NO repository field while the
+    // bundle has had one since 0.1.0 (which is why publish.yml worked and a
+    // per-uck OIDC publish would not). Inherited from the bundle so a per-uck
+    // manifest cannot silently point at a different repo than the workflow that
+    // publishes it. `publishConfig.access` makes the public visibility explicit
+    // instead of relying on every caller remembering `--access public`.
+    repository: cur.repository ?? pkg.repository,
+    publishConfig: cur.publishConfig ?? { access: "public" },
     keywords: [...new Set([...(cur.keywords ?? []), "fcli", "fcli-uck", "uck", "cli"])],
     // Ship the uck AND every local sibling it imports. The `files` allowlist is a
     // WHITELIST: `index.js` alone silently drops a uck's own module directory. Two

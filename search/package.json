@@ -13,5 +13,12 @@
   "files": [
     "index.js",
     "uckmain.js"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fclidev/fcli-ucks.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }
