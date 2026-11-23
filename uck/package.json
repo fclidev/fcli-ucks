@@ -3,7 +3,7 @@
   "type": "module",
   "description": "f uck: push store ucks to a git repo (bucket name = target name)",
   "main": "index.js",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "license": "GPL-3.0-only",
   "keywords": [
     "fcli",

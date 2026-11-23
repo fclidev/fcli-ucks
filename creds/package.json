@@ -3,7 +3,7 @@
   "type": "module",
   "description": "f uck: store credentials (scrypt+AES-GCM, daemon+socket, ttl)",
   "main": "index.js",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "license": "GPL-3.0-only",
   "keywords": [
     "fcli",
