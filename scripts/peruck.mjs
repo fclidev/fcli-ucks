@@ -6,40 +6,32 @@
 // WHY THIS EXISTS, and the two measured facts it encodes (both were wrong in the
 // original design note, so they are recorded here rather than assumed):
 //
-// 1. `lib/` IS BUILD-TIME SOURCE, NOT A RUNTIME DEPENDENCY OF ANYTHING - AND NOT
-//    OF CREDS EITHER. Measured 2026-11-23 by grepping every uck's index.js in BOTH
-//    the source tree and the assembled dist/ for real (non-comment) imports:
-//      - NO uck imports anything under lib/. Not providers, not creds, not any.
-//      - providers/index.js:50 is `export { uckMain, isMain } from "./uckmain.js"`
-//        - a LOCAL vendored copy. The `../lib/uckmain.js` form is only a COMMENT
-//        now (providers/index.js:20, and the prose at :46-47). An earlier revision
-//        of this note cited `providers/index.js:47` as a live import; that line is
-//        now a comment, so the claim was stale. Re-derive it, do not trust this note.
-//      - lib/credsresolve.js does not exist in THIS repo. lib/creds-error.js has no
-//        importer outside its own header; CONTRACT.md §6.1 records that
-//        `classifyCredsError` moved into the creds uck as the PRIVATE `classifyThrown`
-//        (creds/index.js:1334, used at :1175) and that consumers now get §7.2 kinds
-//        from `resolveCred`. So there is nothing left to classify at a distance.
-//    VERDICT on "lib should be part of creds": the DIRECTION is right (creds is the
-//    shared surface) but there is nothing to move - creds has zero import-time
-//    dependency on lib/, and lib/creds-error.js is dead code whose CONTRACT-sanctioned
-//    replacement already lives in creds. `lib/uckmain.js` belongs to NO uck: it is the
-//    single source that vendorUckMain() copies into consumers, and it is used by
-//    providers only because `f creds` probes providers by running
-//    `node <uck>/index.js resolve <name>` in a child process.
-//    What IS true is the runtime half of that decision: ucks reach creds through
-//    `ctx.registry.creds.credsApi` at run() time, because f passes `registry` into
-//    run() only (f dist/index.js:1191), never into register(). That is a contract,
-//    not a package dependency - which is exactly why per-uck packages can publish
-//    with no lib package. This script therefore does NOT invent a lib dependency.
-//    CAUTION, because lib/ is NOT inert in the shipping bundle: assemble.mjs treats
-//    any dir named `lib` with a package.json as "shared" and copies the WHOLE thing
-//    into dist/lib, so @fcli.dev/ucks today ships lib/creds-error.js (dead),
-//    lib/uckmain.js (unreachable - dist/providers uses ./uckmain.js) and a
-//    lib/package.json whose only job is to make that copy happen. Deleting either
-//    lib file therefore changes what the EXISTING bundle contains: delete them
-//    deliberately, in their own commit, not as a side effect of packaging work.
-//
+// 1. THERE IS NO SHARED lib/ ANY MORE, AND NONE IS NEEDED. Measured 2026-11-23:
+//      - NO uck imported anything under lib/. Not providers, not creds, not any.
+//        providers' `export { uckMain, isMain } from "./uckmain.js"` had ZERO
+//        importers (grep isMain matched only that export line) and providers has no
+//        main() to guard, so the whole vendoring chain existed to ship a dead file.
+//      - lib/creds-error.js had no importer either; CONTRACT.md §6.1 already moved
+//        `classifyCredsError` into the creds uck as the PRIVATE `classifyThrown`
+//        (creds/index.js:1334, used :1175), consumers get §7.2 kinds from resolveCred.
+//      - lib/credsresolve.js never existed in THIS repo (it does in the personal
+//        bucket, which is a separate cleanup).
+//    So the probe-entry guard is now an IMPLIED CONTRACT documented in CONTRACT.md
+//    §P4 with the canonical snippet. Why implied rather than shared: a published
+//    per-uck package contains only <uck>/, so `../lib/uckmain.js` resolves to nothing
+//    after install; putting it in creds would make providers import creds while creds
+//    discovers providers by importing every uck (an import cycle, and against §P4's
+//    self-registration); and the guard is ~12 lines that copy cleanly. Measured before
+//    deciding: a guard-free provider satisfies P4 (status/has/resolve all exit 0 with
+//    correct stdout), and a crash exits 1 with or without the guard - classifyThrown
+//    returns `provider` for both, and `has`/`status` reach the same fallback. The
+//    guard's only real edge is a one-line `f: ...` stderr instead of a Node stack.
+//    What IS still true: ucks reach creds through ctx.registry.creds.credsApi at run()
+//    time (f passes `registry` into run() only, f dist/index.js:1191, never into
+//    register()). That is a runtime contract no manifest can express - which is
+//    exactly why per-uck packages publish with no shared package at all.
+//    GUARD KEPT: `escapes` below is a hard error for any `../` import, and
+//    providers/index.js specifically may never import ../lib/ again.
 // 2. NO UCK IMPORTS `@fcli.dev/f`. That was my own false finding: I pattern-matched
 //    a comment (`providers/index.js:20` is a commented-out `// from ../lib/uckmain.js`)
 //    and generalised from the PERSONAL bucket, where gh imports @octokit/rest and fj
@@ -146,12 +138,14 @@ function importsOf(name) {
   if (name === "config" && !src.includes("jsonpath-plus")) {
     throw new Error("peruck.mjs: prose filter destroyed a real require() in config/index.js");
   }
-  // The relative import must still resolve to a real LOCAL file, or `providers` would
-  // publish un-installable. It must NOT point at ../lib (that escapes the package).
+  // Guard for the OLD vendored-uckmain shape, kept deliberately narrow: providers
+  // must never go back to `../lib/...`, because that escapes the package dir and
+  // cannot install (this is the bug that made 5/7 ucks un-installable). The old
+  // assertion that a local ./uckmain.js import MUST exist was removed on purpose:
+  // the probe-entry guard is now an IMPLIED contract (CONTRACT.md §P4) and providers
+  // has no main() to guard, so it had no reason to import it. Re-derive with:
+  //   grep -n '\.\./lib/' providers/index.js   -> must print nothing
   if (name === "providers") {
-    if (!src.includes("./uckmain.js")) {
-      throw new Error("peruck.mjs: prose filter destroyed providers' local ./uckmain.js import");
-    }
     if (/from\s+["'`]\.\.\/lib\//.test(src)) {
       throw new Error("peruck.mjs: providers/index.js imports ../lib/ again - that escapes the package and cannot install");
     }
@@ -191,23 +185,14 @@ for (const name of uckDirs) {
   const pjPath = path.join(root, name, "package.json");
   const cur = read(pjPath);
   const imports = importsOf(name);
-  // Whether this uck needs the vendored uckmain.js copy, decided from its SOURCE.
-  // Two wrong attempts recorded so nobody repeats them:
-  //   (a) `imports.own.some(s => s === "lib" || s.startsWith("lib/"))` — false for
-  //       every uck today (no uck imports lib/ any more), so the --write vendor copy
-  //       would silently never run and a new consumer would ship an unresolvable
-  //       import: the exact registers-in-repo/fails-installed class this script exists
-  //       to prevent.
-  //   (b) `imports.own.some(s => s === "./uckmain.js")` — ALSO always false, because
-  //       `bareImports` normalises a non-escaping relative import to its TOP-LEVEL
-  //       DIR NAME ('./uckmain.js' in providers becomes 'providers'). Matching a
-  //       './x.js' string against `own` can never succeed. Verify a predicate by
-  //       printing what it inspects, not by reasoning about the data shape.
-  // The source text is the ground truth here: an import of a local ./uckmain.js is
-  // what requires the file to exist inside the published package.
-  const usesUckMain = /from\s+["'`]\.\/uckmain\.js["'`]|require\(["'`]\.\/uckmain\.js["'`]\)/.test(
-    codeOnly(readFileSync(path.join(root, name, "index.js"), "utf8")),
-  ) || imports.own.some((s) => s === "lib" || s.startsWith("lib/"));
+  // Vendoring is GONE: the probe-entry guard is an implied contract (CONTRACT.md
+  // §P4), so no uck gets a generated uckmain.js any more and `files` is left exactly
+  // as authored. Why it was removed rather than kept as convenience: the only
+  // consumer in this repo was a re-export with ZERO importers (providers has no
+  // main()), the guard itself is ~12 lines that copy cleanly, and the vendoring
+  // predicate had already been silently-always-false for its whole life - the
+  // mechanism cost more than the file saved. Preserved below: `escapes` still fails
+  // the build for any `../` import, which is the actual install-breaking class.
   // Real npm deps, so a required module is never left undeclared.
   const realDeps = depsOf(name, topDirs);
   // A bare specifier that is not declared is an install-time break: the uck imports
@@ -255,19 +240,20 @@ for (const name of uckDirs) {
       for (const mm of src.matchAll(/(?:from|import|require)\s*\(?\s*["'`](\.[^"'`\n]+)["'`]/g)) {
         const target = path.normalize(path.join(root, name, mm[1]));
         const inside = path.relative(path.join(root, name), target);
-        // Keep only siblings inside the uck dir (not ../lib/..., which is vendored).
+        // Keep only siblings inside the uck dir (a `../` import is an ESCAPE and fails
+        // the build below; nothing is vendored to paper over it any more).
         if (!inside.startsWith("..") && existsSync(target)) rel.add(inside);
       }
       const base = ["index.js", "SKILL.md", ...rel];
-      const uniq = [...new Set(base)].filter((f) => existsSync(path.join(root, name, f)) || f === "uckmain.js");
+      // Only files that actually exist on disk. The old `|| f === "uckmain.js"` carve-out
+      // let a generated file into `files` before it was copied; vendoring is gone, so the
+      // whitelist now reflects reality and verify-install.mjs compares it to the tarball.
+      const uniq = [...new Set(base)].filter((f) => existsSync(path.join(root, name, f)));
       // Merge with any existing files field so a hand-authored entry is not lost.
       return [...new Set([...(cur.files ?? []), ...uniq])];
     })(),
     type: cur.type ?? "module",
   };
-  if (usesUckMain) {
-    next.files = next.files?.includes("uckmain.js") ? next.files : [...(next.files ?? []), "uckmain.js"];
-  }
   // Declare every real third-party dep. A fake version ("^0.0.0") would make the
   // package un-installable and read as a green build, so we pin from an explicit
   // reviewed map of registry-verified versions (verified 2026-11-23 via
@@ -290,11 +276,11 @@ for (const name of uckDirs) {
   // GUARD: a packaged index.js must not import anything OUTSIDE the package dir.
   // The tarball contains only the uck dir, so `../lib/x.js` resolves to nothing in a
   // clean store and the uck VANISHES with one stderr line (measured: providers
-  // imported ../lib/uckmain.js and failed to register 5/7). Vendoring the file into
-  // `files` is useless while the import still points outside. ESCAPES = a hard error.
+  // imported ../lib/uckmain.js and failed to register 5/7). No amount of copying into
+  // `files` helps while the import points outside the package. ESCAPES = a hard error.
   const escapes = imports.escapes;
 
-  plans.push({ name, pjPath, next, diffs, imports: imports.own, undeclared, usesUckMain, escapes });
+  plans.push({ name, pjPath, next, diffs, imports: imports.own, undeclared, escapes });
 }
 
 // Report before touching anything -- a manifest change that silently drops a field
@@ -304,7 +290,7 @@ for (const p of plans) {
   const flag = p.diffs.length ? "CHANGE" : "same  ";
   if (p.diffs.length) changed++;
   const nv = p_needsVersion.get(p.name);
-  console.log(`${flag} ${p.name}  imports=[${p.imports.join(", ")}]${p.usesUckMain ? "  <-- relative lib/ import, must vendor uckmain.js" : ""}${p.undeclared.length ? `  !! UNDECLARED BARE DEPS: ${p.undeclared.join(", ")}` : ""}${p.escapes.length ? `  !! ESCAPES PACKAGE (un-installable): ${p.escapes.join(", ")}` : ""}${nv ? `  !! NEEDS-VERSION (not written): ${nv.join(", ")}` : ""}`);
+  console.log(`${flag} ${p.name}  imports=[${p.imports.join(", ")}]${p.undeclared.length ? `  !! UNDECLARED BARE DEPS: ${p.undeclared.join(", ")}` : ""}${p.escapes.length ? `  !! ESCAPES PACKAGE (un-installable): ${p.escapes.join(", ")}` : ""}${nv ? `  !! NEEDS-VERSION (not written): ${nv.join(", ")}` : ""}`);
   for (const d of p.diffs) console.log(`         ${d}`);
 }
 console.log(`\n${plans.length} ucks, ${changed} would change (${write ? "WRITING" : "dry-run, nothing written"})`);
@@ -323,21 +309,7 @@ if (write) {
     writeFileSync(p.pjPath, JSON.stringify(p.next, null, 2) + "\n");
     console.log(`wrote ${path.relative(root, p.pjPath)}`);
   }
-  // The one irreducible duplication: a per-uck package contains only <uck>/, so a
-  // shared uckmain.js cannot be imported across package boundaries and must be
-  // copied in. Which ucks need it is decided by `usesUckMain` (a real import of
-  // ./uckmain.js in that uck's own index.js), NOT by any hardcoded file:line — an
-  // earlier revision of this comment cited "providers/index.js:47" and rotted when
-  // providers vendored the file. Re-derive with:
-  //   grep -rn "from \"\./uckmain.js\"" */index.js
-  for (const p of plans.filter((x) => x.usesUckMain)) {
-    const dest = path.join(root, p.name, "uckmain.js");
-    if (!existsSync(dest)) {
-      mkdirSync(path.dirname(dest), { recursive: true });
-      cpSync(path.join(root, "lib", "uckmain.js"), dest);
-      console.log(`vendored lib/uckmain.js -> ${p.name}/uckmain.js`);
-    }
-  }
+  // (No vendoring step: the probe-entry guard is an implied contract, CONTRACT.md §P4.)
 }
 
 // Sanity assertion: the plan must cover every register()-exporting dir, and the

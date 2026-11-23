@@ -42,12 +42,12 @@ export function __setStoreRootForTests(root) {
   F = path.join(root, ".f");
 }
 
-/** Shared guard so a provider's index.js can run standalone. Vendored copy lives
- *  beside this file (identical to lib/uckmain.js) because a published per-uck
- *  package contains only providers/, so `../lib/uckmain.js` would resolve to nothing
- *  after install. scripts/peruck.mjs FAILS the build if any packaged import escapes
- *  the package dir - that is how this line was caught (5/7 ucks registered pre-fix). */
-export { uckMain, isMain } from "./uckmain.js";
+/* uckMain/isMain used to be re-exported here from a vendored ./uckmain.js. They are
+ * gone: the probe-entry guard is an IMPLIED contract now (CONTRACT.md §P4 gives the
+ * canonical snippet), and this uck never called it - there is no `main()` in this
+ * file, so the re-export had zero importers (grep isMain matched only that line).
+ * Providers that answer the child-process probe put the guard in their own index.js;
+ * copying ~12 lines beats an unshippable ../lib/ import or a creds import cycle. */
 
 /** Probe subcommands a provider entry must answer. */
 export const PROBE_CMDS = ["resolve", "has", "status"];

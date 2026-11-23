@@ -22,17 +22,22 @@ const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
 
 // A uck is any top-level dir with an index.js that exports register().
 // Excluded: dist, node_modules, .git, and helper dirs without an index.js.
-// lib/ is a shared helper module (imported by ucks) — included but not
-// listed as a uck in the manifest.
+// There is no shared helper module: measured 2026-11-23, no uck imported anything
+// under lib/, so the old "lib/ is imported by ucks" claim below this line was false
+// and the copy it justified shipped dead files. See the `shared` list further down.
 const ucks = readdirSync(root, { withFileTypes: true })
   .filter((d) => d.isDirectory())
   .map((d) => d.name)
   .filter((n) => !["dist", "node_modules", ".git", "scripts"].includes(n))
   .filter((n) => existsSync(path.join(root, n, "index.js")));
-const shared = readdirSync(root, { withFileTypes: true })
-  .filter((d) => d.isDirectory())
-  .map((d) => d.name)
-  .filter((n) => n === "lib" && existsSync(path.join(root, n, "package.json")));
+// No "shared" dir any more. `lib/` used to be copied wholesale into dist/ because it
+// had a package.json, which shipped lib/creds-error.js (dead, superseded by the
+// private classifyThrown in the creds uck) and lib/uckmain.js (unreachable: dist/
+// providers used its own vendored copy). Both are gone: the probe-entry guard is an
+// implied contract, CONTRACT.md §P4. If a real shared runtime module ever appears it
+// needs a REAL importer, and then this list should be explicit rather than "any dir
+// named lib with a package.json" - that rule shipped nothing useful for its whole life.
+const shared = [];
 
 // Rebuild from scratch. dist/ is gitignored and cpSync never deletes, so a
 // stale dir survives every later build and npm pack ships it: ls/ and w/ were
