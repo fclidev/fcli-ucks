@@ -11,6 +11,7 @@
     "cli"
   ],
   "files": [
+    "SKILL.md",
     "default.md",
     "f-cli.md",
     "index.js",
