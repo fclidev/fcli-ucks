@@ -42,9 +42,12 @@ export function __setStoreRootForTests(root) {
   F = path.join(root, ".f");
 }
 
-/** Shared guard so a provider's index.js can run standalone; lives one level up
- *  because the f loader requires every uck dir to export register(ctx). */
-export { uckMain, isMain } from "../lib/uckmain.js";
+/** Shared guard so a provider's index.js can run standalone. Vendored copy lives
+ *  beside this file (identical to lib/uckmain.js) because a published per-uck
+ *  package contains only providers/, so `../lib/uckmain.js` would resolve to nothing
+ *  after install. scripts/peruck.mjs FAILS the build if any packaged import escapes
+ *  the package dir - that is how this line was caught (5/7 ucks registered pre-fix). */
+export { uckMain, isMain } from "./uckmain.js";
 
 /** Probe subcommands a provider entry must answer. */
 export const PROBE_CMDS = ["resolve", "has", "status"];

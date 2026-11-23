@@ -62,41 +62,126 @@ const read = (p) => (existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : {});
 // read() parses JSON; a .description fallback must never feed it a .js file.
 const readText = (p) => (existsSync(p) ? readFileSync(p, "utf8") : "");
 
-/** Which shared things a uck actually imports, by reading its source. */
+/**
+ * Third-party deps a uck genuinely needs, derived from its code (not prose).
+ * A package that requires a module it does not declare installs fine and then
+ * throws `Cannot find module` at load - the uck VANISHES with one stderr line
+ * while `f uck check` still calls the source tree valid. Measured 2026-11-23:
+ * `config/index.js` does `require("jsonpath-plus")` yet its manifest declared NO
+ * dependencies, so the packed tarball had no way to get jsonpath-plus.
+ * A bare name is a dep UNLESS it resolves inside this repo (root package name,
+ * a top-level dir, or a lib/* helper - those are siblings or vendored, not npm).
+ */
+function depsOf(name, topDirs) {
+  const src = codeOnly(readFileSync(path.join(root, name, "index.js"), "utf8"));
+  const specs = [...src.matchAll(/(?:require|from|import)\s*\(?\s*["'`]([^"'`\n]+)["'`]/g)].map((m) => m[1]);
+  const deps = new Set();
+  for (const s of specs) {
+    if (s.startsWith("node:") || s.startsWith(".")) continue;
+    const pkgName = s.split("/").slice(0, s.startsWith("@") ? 2 : 1).join("/");
+    // Skip things that resolve within this repository, not from npm.
+    if (pkgName === pkg.name) continue;
+    if (topDirs.has(pkgName) || topDirs.has(`lib/${pkgName}`)) continue;
+    if (pkgName.startsWith("lib/")) continue;
+    deps.add(pkgName);
+  }
+  return [...deps].sort();
+}
+
+/** Strip comments/strings-before-scanning. A dependency scanner that reads prose
+ *  INVENTS dependencies, which is strictly worse than missing one: it would have
+ *  added a package literally named "daemon is still starting" to creds' manifest.
+ *  Measured 2026-11-23: the old regex matched `tell 'empty' from 'absent'` and
+ *  `'never existed'` inside comments, and one greedy match spanned 8 real lines of
+ *  code and swallowed them - so the same scanner could swallow a REAL require() and
+ *  publish a package that cannot install. Comments are removed, not skipped-by-luck.
+ *  Order matters: block comments first, then line comments, then the scanner runs
+ *  over code only. String literals are kept because `require(name)` is real usage. */
+function codeOnly(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, " ") // /* ... */ (non-greedy: never span two blocks)
+    .replace(/^[ \t]*\/\/.*$/gm, " ") // whole-line // comments
+    // Blank out WORD-PROSE literals only, and only AFTER comments are gone. Two
+    // boundary rules, each learned by breaking this scanner:
+    //   - no `\n` inside the character class: the `"\n"` in real code must survive,
+    //     or a following `// ... tell 'empty' from 'absent'` merges onto a code line
+    //     and its prose matches as a specifier (this invented an "absent" dep);
+    //   - a dot/colon/dash/slash means it is a PATH or a sentence, not a package
+    //     name, so leave it alone. Otherwise `from "./providers.js"` and
+    //     `require("jsonpath-plus")` get blanked and the uck publishes un-installable
+    //     (the canary below is what proved that).
+    .replace(/["']([A-Za-z][A-Za-z0-9 ]*)['"]/g, (_s, w) => ` ${w.replace(/[^\n]/g, " ")} `);
+}
+
+/** Which shared things a uck actually imports, by reading its code (not its prose). */
 function importsOf(name) {
-  const src = readFileSync(path.join(root, name, "index.js"), "utf8");
+  const src = codeOnly(readFileSync(path.join(root, name, "index.js"), "utf8"));
   // `require()` counts too: config/index.js does `const { JSONPath } =
   // require("jsonpath-plus")` through createRequire, and a from/import-only scan
   // called it dependency-free - the import then fails in a clean store (verified:
-  // config is the one uck that cannot be imported in this checkout). Prose such as
-  // "// from 'absent'" also matches, so bare names are REPORTED, never silently added.
-  const specifiers = [...src.matchAll(/(?:from|import|require)\s*\(?\s*["']([^"']+)["']/g)].map((m) => m[1]);
+  // config is the one uck that cannot be imported in this checkout).
+  const specifiers = [...src.matchAll(/(?:from|import|require)\s*\(?\s*["']([^"'\n]+)["']/g)].map((m) => m[1]);
+  // PROOF THAT THE PROSE FILTER DID NOT BLIND THE SCANNER: jsonpath-plus must still be
+  // present after codeOnly(). Its only occurrence is `require("jsonpath-plus")` via
+  // createRequire, so if it vanishes this function is eating real dependencies.
+  if (name === "config" && !src.includes("jsonpath-plus")) {
+    throw new Error("peruck.mjs: prose filter destroyed a real require() in config/index.js");
+  }
+  // The relative import must still resolve to a real LOCAL file, or `providers` would
+  // publish un-installable. It must NOT point at ../lib (that escapes the package).
+  if (name === "providers") {
+    if (!src.includes("./uckmain.js")) {
+      throw new Error("peruck.mjs: prose filter destroyed providers' local ./uckmain.js import");
+    }
+    if (/from\s+["'`]\.\.\/lib\//.test(src)) {
+      throw new Error("peruck.mjs: providers/index.js imports ../lib/ again - that escapes the package and cannot install");
+    }
+  }
   const own = new Set();
   const bare = new Set();
+  const escapes = new Set();
   for (const s of specifiers) {
     if (s.startsWith("node:")) continue;
     if (s.startsWith(".")) {
+      // The PACKAGE boundary is the uck dir, not the repo root: a published tarball
+      // contains only <uck>/. So `../lib/uckmain.js` is inside THIS repo yet escapes
+      // the PACKAGE - it resolves to nothing after install. Check escape from the uck
+      // dir; the old repo-root test reported providers as a benign "lib" import and
+      // the guard missed the very bug it was written to catch.
       const resolved = path.normalize(path.join(root, name, s));
-      const rel = path.relative(root, resolved);
-      if (rel.startsWith("..")) own.add(`ESCAPES-TREE:${rel}`);
-      else own.add(rel.split(path.sep)[0]);
+      const fromPkg = path.relative(path.join(root, name), resolved);
+      if (fromPkg.startsWith("..")) {
+        escapes.add(s);
+        own.add(s);
+      } else {
+        own.add(path.relative(root, resolved).split(path.sep)[0]);
+      }
     } else {
       own.add(s);
       bare.add(s.split("/").slice(0, s.startsWith("@") ? 2 : 1).join("/"));
     }
   }
-  return { own: [...own].sort(), bare: [...bare].sort() };
+  return { own: [...own].sort(), bare: [...bare].sort(), escapes: [...escapes].sort() };
 }
 
 const plans = [];
+const topDirs = new Set(uckDirs);
+// Deps that are real but whose version we did not verify -> reported, never written.
+const p_needsVersion = new Map();
 for (const name of uckDirs) {
   const pjPath = path.join(root, name, "package.json");
   const cur = read(pjPath);
   const imports = importsOf(name);
   const usesUckMain = imports.own.some((s) => s === "lib" || s.startsWith("lib/"));
+  // Real npm deps, so a required module is never left undeclared.
+  const realDeps = depsOf(name, topDirs);
   // A bare specifier that is not declared is an install-time break: the uck imports
-  // fine in the repo (root node_modules) and fails in a clean store.
-  const undeclared = imports.bare.filter((m) => !(cur.dependencies ?? {})[m] && !(cur.peerDependencies ?? {})[m]);
+  // fine in the repo (root node_modules) and fails in a clean store. RealDeps now
+  // covers the honest ones, so `undeclared` is what's LEFT - imports that resolve
+  // inside the repo (siblings, lib/) rather than from npm: report, don't add.
+  const undeclared = imports.bare.filter(
+    (m) => !(cur.dependencies ?? {})[m] && !(cur.peerDependencies ?? {})[m] && !realDeps.includes(m)
+  );
 
   const next = {
     ...cur,
@@ -107,21 +192,64 @@ for (const name of uckDirs) {
     // relicense a uck; inheriting the bundle's license is the safe default.
     license: cur.license ?? pkg.license,
     keywords: [...new Set([...(cur.keywords ?? []), "fcli", "fcli-uck", "uck", "cli"])],
-    // Ship exactly what a uck needs to register: no dist/, no tests, no node_modules.
-    files: cur.files ?? ["index.js", "SKILL.md", "uckmain.js"].filter(
-      (f) => existsSync(path.join(root, name, f)) || f === "uckmain.js"
-    ),
+    // Ship the uck AND every local sibling it imports. The `files` allowlist is a
+    // WHITELIST: `index.js` alone silently drops a uck's own module directory. Two
+    // measured victims of an index.js-only allowlist on 2026-11-23:
+    //   - creds/index.js does `import ... from "./providers.js"` (its OWN file, not
+    //     the providers uck) - the packed fcli-ucks-creds had NO providers.js, so the
+    //     flagship package could not import;
+    //   - providers/index.js does `export ... from "../lib/uckmain.js"` which ESCAPES
+    //     the package dir and can only be satisfied by vendoring uckmain.js below.
+    // So: enumerate every relative import target that lives inside the uck dir.
+    files: (() => {
+      const src = readFileSync(path.join(root, name, "index.js"), "utf8");
+      const rel = new Set();
+      // Match BOTH forms: static `from "./x.js"` (no paren) AND `require("./x.js")`.
+      // A `require\(\s*`-only regex silently misses every static import sibling -
+      // which is exactly how creds' `./providers.js` was dropped from the manifest.
+      for (const mm of src.matchAll(/(?:from|import|require)\s*\(?\s*["'`](\.[^"'`\n]+)["'`]/g)) {
+        const target = path.normalize(path.join(root, name, mm[1]));
+        const inside = path.relative(path.join(root, name), target);
+        // Keep only siblings inside the uck dir (not ../lib/..., which is vendored).
+        if (!inside.startsWith("..") && existsSync(target)) rel.add(inside);
+      }
+      const base = ["index.js", "SKILL.md", ...rel];
+      const uniq = [...new Set(base)].filter((f) => existsSync(path.join(root, name, f)) || f === "uckmain.js");
+      // Merge with any existing files field so a hand-authored entry is not lost.
+      return [...new Set([...(cur.files ?? []), ...uniq])];
+    })(),
     type: cur.type ?? "module",
   };
   if (usesUckMain) {
     next.files = next.files?.includes("uckmain.js") ? next.files : [...(next.files ?? []), "uckmain.js"];
+  }
+  // Declare every real third-party dep. A fake version ("^0.0.0") would make the
+  // package un-installable and read as a green build, so we pin from an explicit
+  // reviewed map of registry-verified versions (verified 2026-11-23 via
+  // `npm view <pkg> version`, a read). An unmapped dep is reported as NEEDS-VERSION
+  // and NOT written, rather than shipping a version we did not verify.
+  const KNOWN_VERSIONS = { "jsonpath-plus": "^11.3.0" };
+  if (realDeps.length) {
+    next.dependencies = { ...(cur.dependencies ?? {}) };
+    for (const d of realDeps) {
+      if (!next.dependencies[d]) next.dependencies[d] = KNOWN_VERSIONS[d];
+    }
+    const missing = realDeps.filter((d) => !next.dependencies[d]);
+    if (missing.length) p_needsVersion.set(name, missing);
   }
 
   const diffs = Object.keys(next)
     .filter((k) => JSON.stringify(cur[k]) !== JSON.stringify(next[k]))
     .map((k) => `${k}: ${JSON.stringify(cur[k] ?? null)} -> ${JSON.stringify(next[k])}`);
 
-  plans.push({ name, pjPath, next, diffs, imports: imports.own, undeclared, usesUckMain });
+  // GUARD: a packaged index.js must not import anything OUTSIDE the package dir.
+  // The tarball contains only the uck dir, so `../lib/x.js` resolves to nothing in a
+  // clean store and the uck VANISHES with one stderr line (measured: providers
+  // imported ../lib/uckmain.js and failed to register 5/7). Vendoring the file into
+  // `files` is useless while the import still points outside. ESCAPES = a hard error.
+  const escapes = imports.escapes;
+
+  plans.push({ name, pjPath, next, diffs, imports: imports.own, undeclared, usesUckMain, escapes });
 }
 
 // Report before touching anything -- a manifest change that silently drops a field
@@ -130,10 +258,19 @@ let changed = 0;
 for (const p of plans) {
   const flag = p.diffs.length ? "CHANGE" : "same  ";
   if (p.diffs.length) changed++;
-  console.log(`${flag} ${p.name}  imports=[${p.imports.join(", ")}]${p.usesUckMain ? "  <-- relative lib/ import, must vendor uckmain.js" : ""}${p.undeclared.length ? `  !! UNDECLARED BARE DEPS: ${p.undeclared.join(", ")}` : ""}`);
+  const nv = p_needsVersion.get(p.name);
+  console.log(`${flag} ${p.name}  imports=[${p.imports.join(", ")}]${p.usesUckMain ? "  <-- relative lib/ import, must vendor uckmain.js" : ""}${p.undeclared.length ? `  !! UNDECLARED BARE DEPS: ${p.undeclared.join(", ")}` : ""}${p.escapes.length ? `  !! ESCAPES PACKAGE (un-installable): ${p.escapes.join(", ")}` : ""}${nv ? `  !! NEEDS-VERSION (not written): ${nv.join(", ")}` : ""}`);
   for (const d of p.diffs) console.log(`         ${d}`);
 }
 console.log(`\n${plans.length} ucks, ${changed} would change (${write ? "WRITING" : "dry-run, nothing written"})`);
+
+// Hard-fail on any escaping import or unverified dep: those produce packages that
+// install cleanly and then cannot load, which is the worst failure (silent vanish).
+const blocking = plans.filter((p) => p.escapes.length || p_needsVersion.has(p.name));
+if (blocking.length) {
+  console.log(`\nBLOCKED: ${blocking.map((p) => p.name).join(", ")} - fix escaping imports / dep versions before publishing.`);
+  process.exitCode = 1;
+}
 
 if (write) {
   for (const p of plans) {

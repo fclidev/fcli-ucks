@@ -14,6 +14,7 @@
   "files": [
     "index.js",
     "SKILL.md",
-    "uckmain.js"
+    "uckmain.js",
+    "providers.js"
   ]
 }

@@ -68,8 +68,22 @@ for (const name of [...shared, ...ucks].sort()) {
     // and the first consumer that enumerates ucks from it would see one uck in a bundle
     // of eight. Deps still come from the same object below.
     const uckPkg = JSON.parse(readFileSync(uckPkgPath, "utf8"));
+    // A uck dir that exports register() but has no name is the same misdescription
+    // class: the bundle would claim a uck it cannot identify. Fail, don't record {}.
+    if (!uckPkg.name) {
+      console.error(`ERROR: ${name}/package.json has no "name" - it would ship unidentified.`);
+      process.exitCode = 1;
+    }
     manifest.ucks[name] = uckPkg;
   } else {
+    // A register()-exporting dir with NO package.json used to be recorded as `{}` and
+    // shipped. `f` loads it from dist/<name>/index.js (so it works in the bundle), but
+    // it can never be published per-uck and the manifest describes it as an empty
+    // object. Loud, not silent: this is the same "misdescribes the artifact" trap as
+    // the 0.2.0 dep bug in the comment above.
+    console.error(`ERROR: ${name}/ exports register() but has no package.json - cannot be published per-uck.`);
+    console.error(`       run: node scripts/peruck.mjs --write`);
+    process.exitCode = 1;
     manifest.ucks[name] = {};
   }
 }
