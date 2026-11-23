@@ -1,4 +1,17 @@
 {
   "name": "fcli-ucks-search",
-  "type": "module"
+  "type": "module",
+  "version": "0.4.1",
+  "description": "f search",
+  "license": "GPL-3.0-only",
+  "keywords": [
+    "fcli",
+    "fcli-uck",
+    "uck",
+    "cli"
+  ],
+  "files": [
+    "index.js",
+    "uckmain.js"
+  ]
 }
