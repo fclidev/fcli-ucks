@@ -191,7 +191,23 @@ for (const name of uckDirs) {
   const pjPath = path.join(root, name, "package.json");
   const cur = read(pjPath);
   const imports = importsOf(name);
-  const usesUckMain = imports.own.some((s) => s === "lib" || s.startsWith("lib/"));
+  // Whether this uck needs the vendored uckmain.js copy, decided from its SOURCE.
+  // Two wrong attempts recorded so nobody repeats them:
+  //   (a) `imports.own.some(s => s === "lib" || s.startsWith("lib/"))` — false for
+  //       every uck today (no uck imports lib/ any more), so the --write vendor copy
+  //       would silently never run and a new consumer would ship an unresolvable
+  //       import: the exact registers-in-repo/fails-installed class this script exists
+  //       to prevent.
+  //   (b) `imports.own.some(s => s === "./uckmain.js")` — ALSO always false, because
+  //       `bareImports` normalises a non-escaping relative import to its TOP-LEVEL
+  //       DIR NAME ('./uckmain.js' in providers becomes 'providers'). Matching a
+  //       './x.js' string against `own` can never succeed. Verify a predicate by
+  //       printing what it inspects, not by reasoning about the data shape.
+  // The source text is the ground truth here: an import of a local ./uckmain.js is
+  // what requires the file to exist inside the published package.
+  const usesUckMain = /from\s+["'`]\.\/uckmain\.js["'`]|require\(["'`]\.\/uckmain\.js["'`]\)/.test(
+    codeOnly(readFileSync(path.join(root, name, "index.js"), "utf8")),
+  ) || imports.own.some((s) => s === "lib" || s.startsWith("lib/"));
   // Real npm deps, so a required module is never left undeclared.
   const realDeps = depsOf(name, topDirs);
   // A bare specifier that is not declared is an install-time break: the uck imports
@@ -307,8 +323,13 @@ if (write) {
     writeFileSync(p.pjPath, JSON.stringify(p.next, null, 2) + "\n");
     console.log(`wrote ${path.relative(root, p.pjPath)}`);
   }
-  // The one irreducible duplication (providers/index.js:47 imports ../lib/uckmain.js,
-  // which cannot resolve across package boundaries).
+  // The one irreducible duplication: a per-uck package contains only <uck>/, so a
+  // shared uckmain.js cannot be imported across package boundaries and must be
+  // copied in. Which ucks need it is decided by `usesUckMain` (a real import of
+  // ./uckmain.js in that uck's own index.js), NOT by any hardcoded file:line — an
+  // earlier revision of this comment cited "providers/index.js:47" and rotted when
+  // providers vendored the file. Re-derive with:
+  //   grep -rn "from \"\./uckmain.js\"" */index.js
   for (const p of plans.filter((x) => x.usesUckMain)) {
     const dest = path.join(root, p.name, "uckmain.js");
     if (!existsSync(dest)) {
