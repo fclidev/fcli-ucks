@@ -396,12 +396,57 @@ A provider is a uck object that additionally carries `credentialProvider`:
 - **P4. Discovery** is by importing every installed uck and reading its
   `credentialProvider` export (in-process) — plus, for providers whose
   `index.js` is also a CLI entry, a **child-process probe protocol**:
-  `node <dir>/index.js resolve <name> | has <name> | status`, wired via
-  `uckMain(import.meta.url, main)`. `f providers --dump` is the
-  machine-readable output of discovery; `f creds` consumes it.
-  *(GAP G6-adjacent: today a broken probe wiring fails silently on first miss.
-  Extend `f providers --dump` to self-test the probe subcommands and report
-  providers as `invalid` with the reason.)*
+  `node <dir>/index.js resolve <name> | has <name> | status`. `f providers --dump`
+  is the machine-readable output of discovery; `f creds` consumes it.
+
+  **The entry guard is an implied contract, not a shared file.** There is no
+  `lib/uckmain.js`, no `@fcli.dev/uckmain`, and no vendoring step. Put these lines in
+  your own `index.js`:
+
+  ```js
+  import { realpathSync } from "node:fs";
+  import { pathToFileURL } from "node:url";
+
+  const isMain = (metaUrl, argv = process.argv) => {
+    const self = argv[1];
+    if (!self) return false;
+    try {
+      return pathToFileURL(realpathSync(self)).href === metaUrl;
+    } catch {
+      return false;
+    }
+  };
+
+  if (isMain(import.meta.url)) {
+    main(process.argv.slice(2))
+      .then((code) => { if (typeof code === "number" && code !== 0) process.exitCode = code; })
+      .catch((e) => { process.stderr.write(`f: ${e?.message ?? e}\n`); process.exitCode = 1; });
+  }
+  ```
+
+  `realpathSync` is required, not decoration: it is the same expression §S2's `here`
+  uses, and it is what keeps the check correct under both the `<bucket>/<uck>/` layout
+  and the flattened local-source layout (N4, §7.3). `isMain` must be an ordinary
+  function call at module scope, never a top-level `await` or import-time side effect
+  (N3) — that, not the helper, is what makes importing a provider safe.
+
+  *Why implied.* Three measured reasons:
+  - A published per-uck tarball contains only `<uck>/`, so a `../lib/…` import
+    resolves to **nothing** after install and the uck vanishes silently.
+  - Putting the guard in `creds` would make providers import creds, while creds
+    discovers providers by importing every installed uck — an import cycle, and
+    contrary to this section's self-registration design.
+  - The helper is 12 lines that copy cleanly, and it changes **no** control flow: a
+    guard-free provider passes `status`/`has`/`resolve` (exit 0, correct stdout), and a
+    crash exits 1 either way — `classifyThrown` reports `provider` for both, and `has`
+    and `status` reach the same fallback. Its only real benefit is a one-line
+    `f: …` stderr instead of a Node stack trace, which shows up as the `hint` in
+    `f creds status`.
+  Rejected homes: `creds` (cycle), `providers` (its own re-export had zero importers),
+  a leaf package (one extra npm trusted publisher for 12 lines).
+  *(GAP G6-adjacent: today a broken probe wiring fails silently on first miss — the
+  guard does not detect it either. Extend `f providers --dump` to self-test the probe
+  subcommands and report providers as `invalid` with the reason.)*
 - **P5. Provider environment rules:** module scope side-effect free (N3);
   never prompt (throw instead); pass `F_CREDS_NO_PROVIDER=1` through when
   shelling out to `f` (recursion guard); never put secrets in `argv` (providers

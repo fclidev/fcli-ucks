@@ -1,4 +1,17 @@
 {
-  "name": "fcli-ucks-providers",
-  "type": "module"
+  "name": "@fcli.dev/providers",
+  "type": "module",
+  "version": "0.4.1",
+  "description": "f providers",
+  "license": "GPL-3.0-only",
+  "keywords": [
+    "fcli",
+    "fcli-uck",
+    "uck",
+    "cli"
+  ],
+  "files": [
+    "index.js",
+    "uckmain.js"
+  ]
 }

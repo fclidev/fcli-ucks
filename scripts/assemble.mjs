@@ -22,17 +22,22 @@ const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
 
 // A uck is any top-level dir with an index.js that exports register().
 // Excluded: dist, node_modules, .git, and helper dirs without an index.js.
-// lib/ is a shared helper module (imported by ucks) — included but not
-// listed as a uck in the manifest.
+// There is no shared helper module: measured 2026-11-23, no uck imported anything
+// under lib/, so the old "lib/ is imported by ucks" claim below this line was false
+// and the copy it justified shipped dead files. See the `shared` list further down.
 const ucks = readdirSync(root, { withFileTypes: true })
   .filter((d) => d.isDirectory())
   .map((d) => d.name)
   .filter((n) => !["dist", "node_modules", ".git", "scripts"].includes(n))
   .filter((n) => existsSync(path.join(root, n, "index.js")));
-const shared = readdirSync(root, { withFileTypes: true })
-  .filter((d) => d.isDirectory())
-  .map((d) => d.name)
-  .filter((n) => n === "lib" && existsSync(path.join(root, n, "package.json")));
+// No "shared" dir any more. `lib/` used to be copied wholesale into dist/ because it
+// had a package.json, which shipped lib/creds-error.js (dead, superseded by the
+// private classifyThrown in the creds uck) and lib/uckmain.js (unreachable: dist/
+// providers used its own vendored copy). Both are gone: the probe-entry guard is an
+// implied contract, CONTRACT.md §P4. If a real shared runtime module ever appears it
+// needs a REAL importer, and then this list should be explicit rather than "any dir
+// named lib with a package.json" - that rule shipped nothing useful for its whole life.
+const shared = [];
 
 // Rebuild from scratch. dist/ is gitignored and cpSync never deletes, so a
 // stale dir survives every later build and npm pack ships it: ls/ and w/ were
@@ -68,8 +73,22 @@ for (const name of [...shared, ...ucks].sort()) {
     // and the first consumer that enumerates ucks from it would see one uck in a bundle
     // of eight. Deps still come from the same object below.
     const uckPkg = JSON.parse(readFileSync(uckPkgPath, "utf8"));
+    // A uck dir that exports register() but has no name is the same misdescription
+    // class: the bundle would claim a uck it cannot identify. Fail, don't record {}.
+    if (!uckPkg.name) {
+      console.error(`ERROR: ${name}/package.json has no "name" - it would ship unidentified.`);
+      process.exitCode = 1;
+    }
     manifest.ucks[name] = uckPkg;
   } else {
+    // A register()-exporting dir with NO package.json used to be recorded as `{}` and
+    // shipped. `f` loads it from dist/<name>/index.js (so it works in the bundle), but
+    // it can never be published per-uck and the manifest describes it as an empty
+    // object. Loud, not silent: this is the same "misdescribes the artifact" trap as
+    // the 0.2.0 dep bug in the comment above.
+    console.error(`ERROR: ${name}/ exports register() but has no package.json - cannot be published per-uck.`);
+    console.error(`       run: node scripts/peruck.mjs --write`);
+    process.exitCode = 1;
     manifest.ucks[name] = {};
   }
 }

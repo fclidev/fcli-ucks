@@ -1,6 +1,21 @@
 {
-  "name": "fcli-ucks-creds",
+  "name": "@fcli.dev/creds",
   "type": "module",
   "description": "f uck: store credentials (scrypt+AES-GCM, daemon+socket, ttl)",
-  "main": "index.js"
+  "main": "index.js",
+  "version": "0.4.1",
+  "license": "GPL-3.0-only",
+  "keywords": [
+    "fcli",
+    "fcli-uck",
+    "uck",
+    "cli"
+  ],
+  "files": [
+    "SKILL.md",
+    "daemon.js",
+    "index.js",
+    "providers.js",
+    "uckmain.js"
+  ]
 }

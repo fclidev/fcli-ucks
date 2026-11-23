@@ -42,9 +42,12 @@ export function __setStoreRootForTests(root) {
   F = path.join(root, ".f");
 }
 
-/** Shared guard so a provider's index.js can run standalone; lives one level up
- *  because the f loader requires every uck dir to export register(ctx). */
-export { uckMain, isMain } from "../lib/uckmain.js";
+/* uckMain/isMain used to be re-exported here from a vendored ./uckmain.js. They are
+ * gone: the probe-entry guard is an IMPLIED contract now (CONTRACT.md §P4 gives the
+ * canonical snippet), and this uck never called it - there is no `main()` in this
+ * file, so the re-export had zero importers (grep isMain matched only that line).
+ * Providers that answer the child-process probe put the guard in their own index.js;
+ * copying ~12 lines beats an unshippable ../lib/ import or a creds import cycle. */
 
 /** Probe subcommands a provider entry must answer. */
 export const PROBE_CMDS = ["resolve", "has", "status"];

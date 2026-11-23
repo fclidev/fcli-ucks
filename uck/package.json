@@ -1,6 +1,19 @@
 {
-  "name": "fcli-ucks-uck",
+  "name": "@fcli.dev/uck",
   "type": "module",
   "description": "f uck: push store ucks to a git repo (bucket name = target name)",
-  "main": "index.js"
+  "main": "index.js",
+  "version": "0.4.1",
+  "license": "GPL-3.0-only",
+  "keywords": [
+    "fcli",
+    "fcli-uck",
+    "uck",
+    "cli"
+  ],
+  "files": [
+    "index.js",
+    "SKILL.md",
+    "uckmain.js"
+  ]
 }
