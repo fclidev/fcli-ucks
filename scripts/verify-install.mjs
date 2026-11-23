@@ -18,7 +18,7 @@
 // COUNT, not the absence of an error message - a vanished uck prints almost nothing.
 // It is read-only on the repo (writes only to a temp dir) and needs no npm auth.
 
-import { mkdtempSync, rmSync, readdirSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -73,6 +73,43 @@ try {
   // 3. Import + register each INSTALLED package. The module path is resolved from
   //    the store, so a missing sibling or an escaping ../ import throws here exactly
   //    as it would inside `f`.
+  // 2b. ASSERT THE RUNTIME ASSET CLOSURE, from the tarball bytes on disk.
+  //
+  // Importing index.js only proves the JS graph loads. A uck that reads a sibling
+  // at RUNTIME via `join(here, "default.md")` or spawns `join(__dirname, "daemon.js")`
+  // imports nothing, so it registers fine and then does nothing (or crashes) for the
+  // user - the same silent class as a dropped sibling. `files` is a WHITELIST, so an
+  // omission ships silently. Measured 2026-11-23 on this very branch: `skills` shipped
+  // neither default.md nor f-cli.md (both read by index.js) and `creds` omitted
+  // daemon.js (which index.js spawns) while 7/7 registered green. Do not assert the
+  // declared `files` array - assert what npm ACTUALLY packed.
+  const assetProblems = [];
+  for (const name of uckDirs) {
+    const srcDir = path.join(root, name);
+    const pkg = JSON.parse(readFileSync(path.join(srcDir, "package.json"), "utf8"));
+    // Every relative asset the shipped code names: string literals AND
+    // join/resolve(__dirname|here, "x") forms, across ALL shipped .js files.
+    const wanted = new Set();
+    for (const f of readdirSync(srcDir).filter((x) => x.endsWith(".js"))) {
+      const s = readFileSync(path.join(srcDir, f), "utf8");
+      for (const m of s.matchAll(/["'`](\.\/[A-Za-z0-9_.-]+\.(?:md|json|js))["'`]/g)) wanted.add(m[1].slice(2));
+      for (const m of s.matchAll(/(?:join|resolve)\s*\(\s*(?:__dirname|here)\s*,\s*["']([A-Za-z0-9_.-]+.[A-Za-z0-9]+)["']/g)) wanted.add(m[1]);
+    }
+    wanted.delete("package.json");
+    if (!wanted.size) continue;
+    // What the tarball actually contains, relative to the package root.
+    const listed = execFileSync("tar", ["-tzf", path.join(packDir, `${pkg.name}-${pkg.version}.tgz`)], { encoding: "utf8" })
+      .split("\n").filter(Boolean).map((l) => l.replace(/^package\//, ""));
+    for (const w of [...wanted].sort()) {
+      if (!listed.includes(w)) assetProblems.push(`${name}: code reads ./${w} but the tarball does not ship it`);
+    }
+  }
+  for (const p of assetProblems) console.log("FAIL " + p);
+  if (assetProblems.length) {
+    console.error(`NOT PUBLISHABLE: ${assetProblems.length} runtime asset(s) missing from the tarball.`);
+    failed = true;
+  }
+
   const results = [];
   for (const name of uckDirs) {
     const modPath = path.join(storeDir, "node_modules", `fcli-ucks-${name}`, "index.js");
@@ -91,7 +128,7 @@ try {
   for (const r of results) {
     console.log(`${r.ok ? "OK  " : "FAIL"} ${r.name}${r.ok ? "  register()=" + r.registered : "  " + r.error}`);
   }
-  console.log(`\n${ok.length}/${uckDirs.length} ucks install AND register from a clean store`);
+  console.log(`\n${ok.length}/${uckDirs.length} ucks install AND register from a clean store; runtime assets ${assetProblems.length === 0 ? "complete" : "INCOMPLETE"}`);
   if (ok.length !== uckDirs.length) {
     console.error("NOT PUBLISHABLE: a uck that cannot import silently vanishes from `f`.");
     failed = true;

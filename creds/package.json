@@ -12,9 +12,10 @@
     "cli"
   ],
   "files": [
-    "index.js",
     "SKILL.md",
-    "uckmain.js",
-    "providers.js"
+    "daemon.js",
+    "index.js",
+    "providers.js",
+    "uckmain.js"
   ]
 }

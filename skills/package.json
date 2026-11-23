@@ -11,6 +11,8 @@
     "cli"
   ],
   "files": [
+    "default.md",
+    "f-cli.md",
     "index.js",
     "uckmain.js"
   ]
