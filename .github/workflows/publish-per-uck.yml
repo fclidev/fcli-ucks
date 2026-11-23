@@ -211,9 +211,13 @@ jobs:
           # source of identity here; the registry check below confirms the result.
           # No NODE_AUTH_TOKEN: npm verifies the OIDC token against the trusted
           # publisher registered for this repo + `npm` environment + this package.
-          # Scoped packages default to restricted visibility, so --access public is
-          # required or the publish is rejected.
-          npm publish --access public
+          # NO --access flag here, deliberately. `npm login --help` is explicit that
+          # when an auth mechanism is supplied, both the manifest's publishConfig and
+          # the flag reach the registry and the MORE RESTRICTIVE value wins. The
+          # manifests now carry publishConfig.access = "public" (set by peruck.mjs), so
+          # the flag was redundant at best and a second source of truth at worst.
+          # Visibility now has exactly one owner: package.json.
+          npm publish
 
       # Verify the EFFECTIVE result from the registry, not from npm's stdout.
       # A `+ <name>` line does not reliably echo what npm published, and `npm view`
@@ -226,17 +230,34 @@ jobs:
           pkg="${{ needs.select.outputs.pkg }}"
           ver="${{ needs.select.outputs.version }}"
           enc="https://registry.npmjs.org/$(printf '%s' "$pkg" | sed 's#/#%2f#')"
-          sleep 5
-          doc="$(curl -sS -m 30 "$enc")"
-          got="$(printf '%s' "$doc" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s)["dist-tags"]?.latest ?? "")}catch{console.log("")}})')"
-          echo "registry latest for $pkg: ${got:-<none>}"
+          # npm answers a successful publish with HTTP 202 and "may take a few
+          # minutes to become available", and the package doc and the tarball
+          # replicate SEPARATELY: measured on 2026-11-23, all seven docs reached
+          # dist-tags.latest ~3 min after a 202, while the tarball URL still 404'd
+          # from a plain curl long after `npm install` had already fetched it. So a
+          # fixed sleep reads an un-replicated doc as a failure and fails a job whose
+          # publish succeeded - and a hand-rolled curl on the tarball is NOT the
+          # installability predicate, `npm install` is. Poll; verify by installing.
+          got=""
+          for i in $(seq 1 24); do
+            sleep 10
+            doc="$(curl -sS -m 30 "$enc" || true)"
+            got="$(printf '%s' "$doc" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s)["dist-tags"]?.latest ?? "")}catch{console.log("")}})')"
+            echo "attempt $i: registry latest for $pkg = ${got:-<none>}"
+            [ "$got" = "$ver" ] && break
+          done
           if [ "$got" != "$ver" ]; then
             echo "::error::expected $pkg@$ver to be latest; registry says '${got:-<none>}'. Check the trusted publisher entry and the package name."
             exit 1
           fi
-          # npm's tarball URL uses the FLATTENED name (scope stripped, '/' -> '-').
-          name_flat="$(printf '%s' "$pkg" | sed 's#^@##; s#/#-#')"
-          code="$(curl -sS -o /dev/null -w '%{http_code}' -m 30 \
-            "https://registry.npmjs.org/$pkg/-/$name_flat-$ver.tgz")"
-          echo "tarball HTTP $code"
-          [ "$code" = "200" ] || { echo "::error::$pkg@$ver tarball not downloadable (HTTP $code)"; exit 1; }
+          # Installability, proven the way a consumer proves it: a clean install from
+          # the registry, then import the installed entry point. This replaces a curl
+          # HEAD on the flattened tarball URL, which 404s for packages that install
+          # correctly and therefore failed honest publishes.
+          probe="$(mktemp -d)"
+          ( cd "$probe" \
+            && printf '{"name":"probe","version":"1.0.0","private":true}\n' > package.json \
+            && npm install --silent --no-audit --no-fund --registry=https://registry.npmjs.org "$pkg@$ver" )
+          ( cd "$probe" && node --input-type=module -e \
+            "const m = await import(\"$pkg\"); if (typeof m.register !== \"function\") { console.error('installed package exports no register()'); process.exit(1); }" )
+          echo "installed $pkg@$ver from the registry; register() present"

@@ -1,7 +1,7 @@
 {
   "name": "@fcli.dev/search",
   "type": "module",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "f search",
   "license": "GPL-3.0-only",
   "keywords": [
