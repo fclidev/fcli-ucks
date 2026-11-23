@@ -1,4 +1,5 @@
 {
-  "name": "@fcli.dev/uck-lib-internal",
-  "type": "module"
+  "name": "@fcli.dev/uck-lib",
+  "type": "module",
+  "private": true
 }

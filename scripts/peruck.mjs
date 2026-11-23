@@ -6,20 +6,39 @@
 // WHY THIS EXISTS, and the two measured facts it encodes (both were wrong in the
 // original design note, so they are recorded here rather than assumed):
 //
-// 1. `lib/` HAS ONE REAL CONSUMER AND IT IS NOT CREDS. Grepping the tree for real
-//    import statements yields exactly one hit:
-//        providers/index.js:47  export { uckMain, isMain } from "../lib/uckmain.js";
-//    `lib/credsresolve.js` DOES NOT EXIST in this repository, and `lib/creds-error.js`
-//    is referenced by nothing except a comment in its own header. So "creds is the
-//    shared library, lib/ belongs to creds" is not implementable as written: creds
-//    has no import-time dependency on lib/ at all. What IS true is the second half of
-//    that decision -- ucks reach creds through `ctx.registry.creds.credsApi` at run()
-//    time, because f passes `registry` into run() only (f dist/index.js:1191), never
-//    into register(). That is a runtime contract, not a package dependency, which is
-//    exactly why per-uck packages can be published without a lib package.
-//    This script therefore does NOT invent a lib dependency. It keeps providers'
-//    relative ../lib/uckmain.js import working by ALSO copying uckmain.js into each
-//    consumer (see vendorUckMain), and flags the one import that would break.
+// 1. `lib/` IS BUILD-TIME SOURCE, NOT A RUNTIME DEPENDENCY OF ANYTHING - AND NOT
+//    OF CREDS EITHER. Measured 2026-11-23 by grepping every uck's index.js in BOTH
+//    the source tree and the assembled dist/ for real (non-comment) imports:
+//      - NO uck imports anything under lib/. Not providers, not creds, not any.
+//      - providers/index.js:50 is `export { uckMain, isMain } from "./uckmain.js"`
+//        - a LOCAL vendored copy. The `../lib/uckmain.js` form is only a COMMENT
+//        now (providers/index.js:20, and the prose at :46-47). An earlier revision
+//        of this note cited `providers/index.js:47` as a live import; that line is
+//        now a comment, so the claim was stale. Re-derive it, do not trust this note.
+//      - lib/credsresolve.js does not exist in THIS repo. lib/creds-error.js has no
+//        importer outside its own header; CONTRACT.md §6.1 records that
+//        `classifyCredsError` moved into the creds uck as the PRIVATE `classifyThrown`
+//        (creds/index.js:1334, used at :1175) and that consumers now get §7.2 kinds
+//        from `resolveCred`. So there is nothing left to classify at a distance.
+//    VERDICT on "lib should be part of creds": the DIRECTION is right (creds is the
+//    shared surface) but there is nothing to move - creds has zero import-time
+//    dependency on lib/, and lib/creds-error.js is dead code whose CONTRACT-sanctioned
+//    replacement already lives in creds. `lib/uckmain.js` belongs to NO uck: it is the
+//    single source that vendorUckMain() copies into consumers, and it is used by
+//    providers only because `f creds` probes providers by running
+//    `node <uck>/index.js resolve <name>` in a child process.
+//    What IS true is the runtime half of that decision: ucks reach creds through
+//    `ctx.registry.creds.credsApi` at run() time, because f passes `registry` into
+//    run() only (f dist/index.js:1191), never into register(). That is a contract,
+//    not a package dependency - which is exactly why per-uck packages can publish
+//    with no lib package. This script therefore does NOT invent a lib dependency.
+//    CAUTION, because lib/ is NOT inert in the shipping bundle: assemble.mjs treats
+//    any dir named `lib` with a package.json as "shared" and copies the WHOLE thing
+//    into dist/lib, so @fcli.dev/ucks today ships lib/creds-error.js (dead),
+//    lib/uckmain.js (unreachable - dist/providers uses ./uckmain.js) and a
+//    lib/package.json whose only job is to make that copy happen. Deleting either
+//    lib file therefore changes what the EXISTING bundle contains: delete them
+//    deliberately, in their own commit, not as a side effect of packaging work.
 //
 // 2. NO UCK IMPORTS `@fcli.dev/f`. That was my own false finding: I pattern-matched
 //    a comment (`providers/index.js:20` is a commented-out `// from ../lib/uckmain.js`)
