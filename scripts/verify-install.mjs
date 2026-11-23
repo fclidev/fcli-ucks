@@ -123,7 +123,12 @@ try {
 
   const results = [];
   for (const name of uckDirs) {
-    const modPath = path.join(storeDir, "node_modules", `fcli-ucks-${name}`, "index.js");
+    // Resolve the INSTALLED path from the package's own name, not a guessed
+    // prefix: names are scoped (`@fcli.dev/<uck>`), so the module lands in
+    // node_modules/@fcli.dev/<uck>. Hardcoding `fcli-ucks-${name}` would import a
+    // path that does not exist and read as "cannot register" for a fine package.
+    const installedName = JSON.parse(readFileSync(path.join(root, name, "package.json"), "utf8")).name;
+    const modPath = path.join(storeDir, "node_modules", ...installedName.split("/"), "index.js");
     try {
       const mod = await import("file://" + modPath);
       if (typeof mod.register !== "function") throw new Error("no register() export");

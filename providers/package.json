@@ -1,5 +1,5 @@
 {
-  "name": "fcli-ucks-providers",
+  "name": "@fcli.dev/providers",
   "type": "module",
   "version": "0.4.1",
   "description": "f providers",

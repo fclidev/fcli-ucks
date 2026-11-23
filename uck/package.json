@@ -1,5 +1,5 @@
 {
-  "name": "fcli-ucks-uck",
+  "name": "@fcli.dev/uck",
   "type": "module",
   "description": "f uck: push store ucks to a git repo (bucket name = target name)",
   "main": "index.js",

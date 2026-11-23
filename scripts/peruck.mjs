@@ -185,7 +185,17 @@ for (const name of uckDirs) {
 
   const next = {
     ...cur,
-    name: cur.name ?? `fcli-ucks-${name}`,
+    // Names are SCOPED: `@fcli.dev/<uck>`, matching the root package and the
+    // fcli.dev site. Chosen 2026-11-23 by kenny over the unscoped
+    // `fcli-ucks-<uck>` this script used to default to.
+    // Two consequences recorded so nobody rediscovers them the hard way:
+    //   1. npm TRUSTED PUBLISHING is per package, so scoped names still mean one
+    //      publisher per uck on npmjs.com - scoping does not amortise that.
+    //   2. npm's packed FILENAME strips the scope (`@a/b-c`@1.2.3 ->
+    //      a-b-c-1.2.3.tgz). Anything computing a tarball path from a package
+    //      name must flatten it; verify-install.mjs now derives it from the
+    //      packDir listing instead.
+    name: cur.name ?? `@fcli.dev/${name}`,
     version: cur.version ?? version,
     description: cur.description ?? `f ${name}`,
     // Never invent a license. The repo is GPL-3.0-only and only the operator can

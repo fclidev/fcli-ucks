@@ -1,5 +1,5 @@
 {
-  "name": "fcli-ucks-config",
+  "name": "@fcli.dev/config",
   "type": "module",
   "description": "f uck: edit f.config.json via JSONPath",
   "main": "index.js",
