@@ -193,7 +193,23 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Install dev deps
-        run: npm ci
+        run: |
+          # `npm ci` is refused on this repo: the root package.json declares NO
+          # dependencies and there is NO package-lock.json, so `npm ci` fails with
+          # EUSAGE ("can only install with an existing package-lock.json") before any
+          # assertion runs. That killed the first real run: select passed, verify died
+          # here, publish was skipped - so nothing was published and nothing was burned.
+          #
+          # There is also nothing to install. The only third-party runtime dep in the
+          # split is jsonpath-plus, declared by config/package.json, and
+          # verify-install.mjs installs each PACKED tarball into a throwaway store, where
+          # npm resolves that dep from the registry - the path actually worth exercising.
+          # If the root ever grows devDependencies, install them here for real.
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "no package-lock.json and no root dependencies: nothing to install"
+          fi
 
       - name: Assert per-uck manifests match reality
         # Dry-run by default: writes nothing, exits non-zero if a uck's
