@@ -78,46 +78,29 @@ await t("(B) a provider reached through the handle sees the store value", async 
     `the provider could not read the store through the handle (got: ${out})`);
 });
 
-await t("(C) discovery with the providers peer wired spawns NOTHING", async () => {
-  // Clear the spawn log: this assertion is about THIS test's spawns, and (B)
-  // legitimately paid for a dump on the pre-fix path.
+await t("(C) discovery answers in-process and spawns NOTHING (the dump child is gone)", async () => {
+  // This assertion used to require a `setProvidersUck` peer seam, because
+  // discovery lived in a SIBLING uck and could only be reached by injecting it or
+  // by spawning `f providers --dump`. Discovery is now this module's own
+  // collect(), so the seam is gone - and the behaviour it existed to prove is now
+  // the only path. Assert the behaviour directly: a real store scan, zero spawns.
   globalThis.__execCalls.length = 0;
-  globalThis.__peerCalled = 0;
   resetProviders(); setProbeCredsRead(storeRead);
-  if (typeof prov.setProvidersUck !== "function") {
-    // Main has no peer seam at all: discovery can only be answered by spawning
-    // the dump. That IS the defect, so record it as a failure rather than skip.
-    globalThis.__execStub = { ret: JSON.stringify([{ name: "behav", entry, canWrite: false }]) };
-    await listProviders();
-    const dump = globalThis.__execCalls.filter((c) => c[0] === "f" && (c[1] ?? []).includes("--dump"));
-    assert.equal(dump.length, 0,
-      `discovery spawned \`f providers --dump\` ${dump.length}x because no in-process peer seam exists`);
-    return;
-  }
-  // setProvidersUck AFTER resetProviders(): reset clears the peer along with
-  // the process-local provider table.
-  prov.setProvidersUck({ name: "providers", run: () => {}, discoverInProcess: async () => {
-    globalThis.__peerCalled = (globalThis.__peerCalled ?? 0) + 1;
-    return [{ name: "behav", entry, canWrite: false, provider: live }];
-  } });
-  // resetProviders() again: discovery is memoised per process (`discovered`), and
-  // test (B) already paid for it. Without this, listProviders() returns the
-  // cached table and never consults the peer - which would make this assertion
-  // pass for the wrong reason on the fix and fail for the wrong reason on main.
-  resetProviders();
+  // Aim discovery at a throwaway uck store holding `behav`. Discovery resolves
+  // join(HOME, ".f", "ucks"), and this suite already set HOME to TMP above, so
+  // the store has to be built under TMP rather than passed in.
+  const UCKS = path.join(TMP, ".f", "ucks", "fixture", "behav");
+  fs.mkdirSync(UCKS, { recursive: true });
+  fs.copyFileSync(entry, path.join(UCKS, "index.js"));
+  if (typeof prov.__setStoreRootForTests === "function") prov.__setStoreRootForTests(TMP);
   globalThis.__execStub = { ret: JSON.stringify([]) };
-  // Diagnostic: is the peer actually visible at the moment discovery runs?
-  if (typeof prov.providersUck === "function") {
-    const pu = prov.providersUck();
-    if (!pu || typeof pu.discoverInProcess !== "function") {
-      throw new Error(`peer not visible to discovery at call time (providersUck()=${JSON.stringify(pu && Object.keys(pu))})`);
-    }
-  }
-  const [p] = await listProviders();
-  if (p.live !== true) throw new Error("discovery did not mark the peer provider live - status() will spawn");
-  await p.status();
-  assert.equal(globalThis.__execCalls.length, 0,
-    `expected 0 spawns on the in-process path, saw ${globalThis.__execCalls.length}: ${JSON.stringify(globalThis.__execCalls.map((c) => [c[0], c[1]]))} | peer called ${globalThis.__peerCalled ?? 0}x`);
+  const out = await listProviders();
+  const dump = globalThis.__execCalls.filter((c) => c[0] === "f" && (c[1] ?? []).includes("--dump"));
+  assert.equal(dump.length, 0,
+    `discovery still spawns \`f providers --dump\` (${dump.length}x) now that discovery is in-module`);
+  const found = out.find((x) => x.name === "behav");
+  if (!found) throw new Error("in-module discovery did not find the fixture provider at all");
+  if (found.live !== true) throw new Error("discovery found the provider but did not mark it live - status() will spawn");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

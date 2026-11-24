@@ -87,8 +87,8 @@ server. A successful lookup is mirrored locally as `mirror:<name>` under a TTL, 
 repeat reads are fast and survive the provider being unreachable.
 
 ```
-f providers                             list providers + readiness
-f providers --dump                      the raw discovery payload ucks are given
+f creds providers                       list providers + readiness
+f creds providers --dump                 the raw discovery payload ucks are given
 f creds get <name> --provider           force a fresh provider read (ignore the mirror)
 f creds get <name> --no-provider        local box only
 f creds get <name> --clear-misses       forget the "not found" backoff
@@ -156,7 +156,7 @@ Discovery accepts only objects with `name: string` **and** `resolve: function`.
 to the daemon's remaining unlocked lifetime so no mirror outlives the session that
 fetched it (`0` = revalidate always).
 
-> `blurb` is read by **nothing** — `f providers` builds output from `{ name, ready,
+> `blurb` is read by **nothing** — `f creds providers` builds output from `{ name, ready,
 > note }`. Anything the operator must see goes in `status().note`.
 
 Do **not** implement `has()` unless you can answer it without the network: it is a
@@ -164,7 +164,9 @@ pre-filter consulted *before* `resolve`, its answer is cached, and a "not mine" 
 timeout makes the provider look empty rather than broken. Omitting `has` entirely is
 always safe — the ladder then just calls `resolve()`.
 
-Discovery is `f providers --dump`, so provider module code runs in every `f` process,
+Discovery is `f creds providers --dump` when no uck store was scanned in-process,
+and `f creds providers --dump`'s own engine otherwise, so provider module code runs in
+every `f` process,
 including ones doing unrelated work: keep module scope side-effect free, do nothing until
 called, and **never block on a passphrase** (throw instead — the caller is already gated
 on `f creds unlock`).

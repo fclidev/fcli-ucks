@@ -138,18 +138,12 @@ function importsOf(name) {
   if (name === "config" && !src.includes("jsonpath-plus")) {
     throw new Error("peruck.mjs: prose filter destroyed a real require() in config/index.js");
   }
-  // Guard for the OLD vendored-uckmain shape, kept deliberately narrow: providers
-  // must never go back to `../lib/...`, because that escapes the package dir and
-  // cannot install (this is the bug that made 5/7 ucks un-installable). The old
-  // assertion that a local ./uckmain.js import MUST exist was removed on purpose:
-  // the probe-entry guard is now an IMPLIED contract (CONTRACT.md §P4) and providers
-  // has no main() to guard, so it had no reason to import it. Re-derive with:
-  //   grep -n '\.\./lib/' providers/index.js   -> must print nothing
-  if (name === "providers") {
-    if (/from\s+["'`]\.\.\/lib\//.test(src)) {
-      throw new Error("peruck.mjs: providers/index.js imports ../lib/ again - that escapes the package and cannot install");
-    }
-  }
+  // Guard for the OLD vendored-uckmain shape. It used to be keyed to the
+  // `providers` uck specifically; that uck is gone (its command is now
+  // `f creds providers`), so the guard is general now: NO uck may import out of
+  // its own directory, because a published tarball ships only <uck>/ and the
+  // import target would not exist after install. That single escape made 5/7
+  // ucks un-installable, and it is checked for every uck below via `escapes`.
   const own = new Set();
   const bare = new Set();
   const escapes = new Set();

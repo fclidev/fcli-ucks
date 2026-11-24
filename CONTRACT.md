@@ -75,7 +75,7 @@ bucket/
 
   *Fixed here:* `providers/index.js` documented the path as
   `lib/uckmain/index.js`; the file is `lib/uckmain.js`. Both now say
-  `../lib/uckmain.js`, which is also what `vaultwarden` and `providers`
+  `../lib/uckmain.js`, which is also what `vaultwarden` did
   actually import.*
 - **N5.** `f` installs a uck's declared dependencies (from its
   `package.json`) into the uck's own `node_modules`, and runs the uck **in
@@ -390,13 +390,13 @@ A provider is a uck object that additionally carries `credentialProvider`:
 - **P2. `has(name)` is a trap.** If it answers false, `resolve` is never
   called and the answer is cached. Implement it only if it can answer
   **offline**. Not implementing it is always safe.
-- **P3. `status()`** reports readiness for `f creds status` / `f providers`.
+- **P3. `status()`** reports readiness for `f creds status` / `f creds providers`.
   Be honest: a provider that claims `ready: true` and throws on every
   `resolve` is worse than one that says what is missing.
 - **P4. Discovery** is by importing every installed uck and reading its
   `credentialProvider` export (in-process) — plus, for providers whose
   `index.js` is also a CLI entry, a **child-process probe protocol**:
-  `node <dir>/index.js resolve <name> | has <name> | status`. `f providers --dump`
+  `node <dir>/index.js resolve <name> | has <name> | status`. `f creds providers --dump`
   is the machine-readable output of discovery; `f creds` consumes it.
 
   **The entry guard is an implied contract, not a shared file.** There is no
@@ -442,10 +442,11 @@ A provider is a uck object that additionally carries `credentialProvider`:
     and `status` reach the same fallback. Its only real benefit is a one-line
     `f: …` stderr instead of a Node stack trace, which shows up as the `hint` in
     `f creds status`.
-  Rejected homes: `creds` (cycle), `providers` (its own re-export had zero importers),
+  Rejected homes: `creds` (cycle at the time), the former `providers` uck (its own
+  re-export had zero importers; that uck is now `f creds providers`),
   a leaf package (one extra npm trusted publisher for 12 lines).
   *(GAP G6-adjacent: today a broken probe wiring fails silently on first miss — the
-  guard does not detect it either. Extend `f providers --dump` to self-test the probe
+  guard does not detect it either. Extend `f creds providers --dump` to self-test the probe
   subcommands and report providers as `invalid` with the reason.)*
 - **P5. Provider environment rules:** module scope side-effect free (N3);
   never prompt (throw instead); pass `F_CREDS_NO_PROVIDER=1` through when

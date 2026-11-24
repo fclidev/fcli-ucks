@@ -638,6 +638,9 @@ export async function listProviders() {
     // The dump's stdout could only ever carry a path, and a path cannot carry a
     // store handle; that is why the handle used to be built, offered, and thrown
     // away. Null (no peer, foreign ctx, peer error) falls through to the spawn.
+    // THE SELF-CALL. Discovery is this module's own `collect()` now, so the fast
+    // path and the old in-process peer path are ONE path, and it returns live
+    // provider objects rather than paths that cannot carry a store handle.
     const live = await discoverViaPeer();
     if (live) {
       for (const p of fromLiveDump(live)) {
@@ -645,35 +648,25 @@ export async function listProviders() {
       }
       return out;
     }
-    // THE SELF-CALL. Discovery is this module's own `collect()` now, so the child
-    // process that used to run `f providers --dump` is gone: the fallback path and
-    // the fast path are the SAME code, and both return live provider objects. The
-    // spawn is kept only as a last resort for a caller that reaches this function
-    // outside a loaded f tree (a bare `node` child, a foreign ctx) where no uck
-    // store was scanned at all - `discoverInProcess()` returns null exactly there.
+    // THE FALLBACK, and it is still reached exactly as before: any process that
+    // cannot answer discovery in-process (no uck store scanned, foreign ctx, a
+    // throw inside collect()) takes this child. Keeping it is not nostalgia -
+    // `f creds get` must still find a provider written against the dump shape, so
+    // an unanswered scan degrades to a spawn rather than to "no providers".
     try {
-      const self = await discoverInProcess();
-      if (self === null) throw new Error("no uck store visible to this process");
-      for (const p of fromLiveDump(self)) {
+      const stdout = execFileSync("f", ["providers", "--dump"], {
+        encoding: "utf8", timeout: 25_000, stdio: ["ignore", "pipe", "pipe"],
+        // Every provider child inherits this, so any nested discovery attempt
+        // returns early instead of spawning another dump. Note that the uck this
+        // spawns is now a DEPRECATED SHIM that prints the same JSON shape; the
+        // contract is the stdout, not which uck produced it.
+        env: { ...process.env, F_CREDS_NO_PROVIDER: "1" },
+      });
+      for (const p of fromChildProcess(stdout)) {
         if (!out.some((x) => x.name === p.name)) out.push(p);
       }
     } catch (e) {
-      // Degrade to the historical child rather than failing discovery: an older or
-      // separately-installed `providers` uck still answers the same dump shape.
-      try {
-        const stdout = execFileSync("f", ["providers", "--dump"], {
-          encoding: "utf8", timeout: 25_000, stdio: ["ignore", "pipe", "pipe"],
-          // Every provider child inherits this, so any nested discovery attempt
-          // returns early instead of spawning another dump.
-          env: { ...process.env, F_CREDS_NO_PROVIDER: "1" },
-        });
-        for (const p of fromChildProcess(stdout)) {
-          if (!out.some((x) => x.name === p.name)) out.push(p);
-        }
-      } catch (e2) {
-        discoveryError.message =
-          e2?.stderr?.toString?.().trim() || e2?.message || e?.message || String(e);
-      }
+      discoveryError.message = e?.stderr?.toString?.().trim() || e?.message || String(e);
     }
   }
   return out;

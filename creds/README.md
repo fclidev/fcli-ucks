@@ -88,8 +88,8 @@ provider; a hit is mirrored locally as `mirror:<name>` under a TTL, so later rea
 offline, fast, and survive the provider being unreachable.
 
 ```bash
-f providers                  # providers + readiness
-f providers --dump           # the raw discovery payload ucks are given
+f creds providers           # providers + readiness
+f creds providers --dump    # the raw discovery payload ucks are given
 ```
 
 Rules that decide what an operator sees when something breaks:
@@ -168,7 +168,7 @@ A pre-filter consulted before `resolve`. If it answers "not mine", `resolve` is
 
 ### `status()`
 
-Feeds `f creds status` / `f providers`. Report `{ ready, note, hint }`. Be honest about
+Feeds `f creds status` / `f creds providers`. Report `{ ready, note, hint }`. Be honest about
 "not ready" — a provider that claims ready and then throws on every `resolve` is worse
 than one that says what is missing.
 
@@ -220,7 +220,7 @@ export default { register };
 
 ### Rules for provider code
 
-- **Module scope must be side-effect free.** Discovery is `f providers --dump`, which
+- **Module scope must be side-effect free.** Discovery is `f creds providers --dump`, which
   runs in `f` processes for unrelated commands. Do no work until `resolve`/`status` is
   called. `uckMain(import.meta.url, main)` exists so `index.js` can be both a CLI entry
   point and an importable provider.

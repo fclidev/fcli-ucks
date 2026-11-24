@@ -5,7 +5,7 @@
 // Provider table (see ./providers.js): every uck that exports a
 // `credentialProvider` is consulted when a name is missing from the box, and the
 // answer is mirrored back in as `mirror:<name>` with a ttl. Local always wins.
-import { registerProvider, collect as collectProviders, checkProbes as checkProviderProbes, listProviders, providerDiscoveryError, setProbeCredsRead, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource, clearMirrorSource } from "./providers.js";
+import { registerProvider, resolveViaProvider, mirrorTtlSec, setMirrorSource, collect as collectProviders, checkProbes as checkProviderProbes, listProviders, providerDiscoveryError, setProbeCredsRead, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource, clearMirrorSource } from "./providers.js";
 
 import net from "node:net";
 import fs from "node:fs";
@@ -2531,6 +2531,9 @@ function usage(msg) {
       "  rm <name>                       remove a cred; if <name> is only a provider\n" +
       "                                    mirror, drops the cache and says the\n" +
       "                                    provider still answers for it\n" +
+      "  providers [--dump]              list credential providers + their readiness\n" +
+      "                                    (this was the separate `providers` uck; --dump\n" +
+      "                                    prints the rows discovery consumes)\n" +
       "  files <sub>                     packed files (key = file:<abs path> + 'files' manifest)\n" +
       "    ls [--json]                       list packed files (terse, or raw manifest JSON)\n" +
       "    pack <path>... [opts]             store files\n" +

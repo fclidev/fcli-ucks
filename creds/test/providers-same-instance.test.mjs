@@ -84,13 +84,64 @@ registerHooks({
 
 const prov = await import(path.join(CREDS, "providers.js"));
 const {
-  fromLiveDump, listProviders, setProvidersUck, setProbeCredsRead,
-  probeCredsHandle, resetProviders,
+  fromLiveDump, listProviders, setProbeCredsRead, setDiscoveryOverride,
+  probeCredsHandle, resetProviders, discoverInProcess, __setStoreRootForTests,
 } = prov;
 
+/**
+ * Replaces the deleted `setProvidersUck` seam.
+ *
+ * The seam injected a PEER uck whose discoverInProcess() returned rows, and
+ * discovery fed those rows through fromLiveDump(). Discovery now calls that
+ * function in THIS module, so only the cross-uck hop is gone - what these cases
+ * assert about live provider objects is unchanged.
+ *
+ * `wire(rows)` installs rows for the NEXT discovery; `wire(null)` means "no
+ * in-process answer", which is the pre-fix world cases (4)/(4b) assert on:
+ * discovery must fall back to the `providers --dump` child rather than report no
+ * providers. Rows are installed by aiming discovery at a fixture uck store, so
+ * the real collect() runs and the real provider module instance is what comes
+ * back - identity assertions below stay honest.
+ */
+let wiredStore = null;
+
+/**
+ * A throwaway store root containing ONLY `rows`' provider entries, or an EMPTY
+ * one when rows is null/empty. Aiming at an empty store is what makes discovery
+ * answer "nothing here" and take the dump-spawn fallback - the state cases
+ * (4)/(4b)/V1 assert on. Returning to a real HOME is not enough: the real store
+ * on a dev box contains genuine providers, so discovery would answer and the
+ * fallback would never run.
+ */
+function aimDiscoveryAt(rows) {
+  const root = fs.mkdtempSync(path.join(os.homedir(), ".f-wired-"));
+  for (const r of rows ?? []) {
+    const dir = path.join(root, ".f", "ucks", "fixture", r.uck ?? r.name);
+    fs.mkdirSync(dir, { recursive: true });
+    // SYMLINK, never copy. Node caches modules by RESOLVED URL, so a copy is a
+    // second instance of the same provider - which silently destroys every
+    // identity assertion in this file (the original peer handed discovery the
+    // very object the test held, and that is the thing under test). A symlinked
+    // uck tree is also a real deployment shape, and isDir() exists specifically
+    // to follow it, so this exercises production behaviour rather than a fixture
+    // convenience.
+    fs.symlinkSync(r.entry, path.join(dir, "index.js"));
+  }
+  return root;
+}
+
+function wire(rows) {
+  __setStoreRootForTests(aimDiscoveryAt(rows));
+}
+
+/** Put discovery where no uck store can be found, so the child path is the only answer. */
+function unwire() {
+  __setStoreRootForTests(path.join(os.homedir(), `.f-absent-${process.pid}-${Math.random().toString(36).slice(2)}`));
+}
+
 /** Fail loudly if the seam under test is missing - otherwise (1)/(2) pass vacuously. */
-if (typeof fromLiveDump !== "function" || typeof setProvidersUck !== "function") {
-  console.log("FAIL harness: fromLiveDump/setProvidersUck absent from creds/providers.js - this suite would test nothing");
+if (typeof fromLiveDump !== "function" || typeof discoverInProcess !== "function") {
+  console.log("FAIL harness: fromLiveDump/discoverInProcess absent from creds/providers.js - this suite would test nothing");
   process.exit(1);
 }
 
@@ -118,11 +169,12 @@ export const credentialProvider = {
 `;
 
 const reset = () => {
+  unwire();
   globalThis.__execCalls.length = 0;
   globalThis.__execStub = null;
   resetProviders();
   setProbeCredsRead(null);
-  setProvidersUck(null);
+  resetProviders();
 };
 
 // The store read the handle wraps. In the real uck this is rawCredRead, whose
@@ -139,27 +191,33 @@ const fakePeer = (rows) => ({
 
 /* ------------------------------------------------------------------- suite */
 
-await t("(1) discovery with the peer wired probes the SAME object the peer found", async () => {
+await t("(1) discovery probes the SAME live object it found (identity, not equality)", async () => {
+  // THE ASSERTION THAT MATTERS: identity, not equality. creds must probe the very
+  // object discovery found, not a second import of its path. The deleted seam
+  // expressed this by injecting a wrapper; there is deliberately no replacement
+  // seam, because discovery now runs collect() over a real uck store and injecting
+  // a wrapper would assert the seam instead of the production path. The store is
+  // SYMLINKED, so collect() resolves to the same module URL this test imported and
+  // Node's cache guarantees one instance - which is what makes identity checkable
+  // without a test-only hook.
   reset();
   const entry = writeProvider(HANDLE_AWARE);
-  // Import the provider the way the providers uck's collect() does, so the
-  // identity assertion below is against a real module instance.
   const live = (await import(pathToFileURL(entry).href)).credentialProvider;
   setProbeCredsRead(storeRead);
-  setProvidersUck(fakePeer([{ name: "handleaware", entry, canWrite: false, provider: live }]));
-
+  wire([{ name: "handleaware", uck: "handleaware", entry, canWrite: false }]);
   const [p] = await listProviders();
+  if (!p) throw new Error("discovery found nothing - the fixture store is not being scanned");
   assert.equal(p.live, true, "discovery did not take the in-process path");
-  // THE ASSERTION THAT MATTERS: identity, not equality. `p.status()` must reach
-  // the very object the peer discovered, not a second import of its path.
-  const seen = [];
-  const probe = { ...live, status: (api = null) => { seen.push(api); return live.status(api); } };
-  setProvidersUck(fakePeer([{ name: "handleaware", entry, canWrite: false, provider: probe }]));
-  resetProviders();
-  const [q] = await listProviders();
-  await q.status();
-  assert.equal(seen.length, 1, "the peer's own status() was never reached - a second instance was probed instead");
-  assert.ok(seen[0] && typeof seen[0].rawCredRead === "function", "the peer's status() got no handle");
+  const scanned = (await import(pathToFileURL(p.external).href)).credentialProvider;
+  assert.equal(scanned, live, "collect() did not reuse the cached module instance");
+  // resolve() must NOT be compared against a bare live.resolve(): the whole point
+  // of the handle is that creds passes one, so p.resolve sees the store value and
+  // a direct live.resolve() sees nothing. Comparing them asserts the opposite of
+  // what this case is about - (3) owns the handle-value assertion.
+  const st = await p.status();
+  assert.equal(st.ready, true, `status() did not reach the in-process handle: ${JSON.stringify(st)}`);
+  assert.equal(globalThis.__execCalls.length, 0,
+    "the live path must not spawn; status() came from the instance, not a child");
 });
 
 await t("(2) the in-process path spawns NOTHING", async () => {
@@ -167,7 +225,7 @@ await t("(2) the in-process path spawns NOTHING", async () => {
   const entry = writeProvider(HANDLE_AWARE);
   const live = (await import(pathToFileURL(entry).href)).credentialProvider;
   setProbeCredsRead(storeRead);
-  setProvidersUck(fakePeer([{ name: "handleaware", entry, canWrite: false, provider: live }]));
+  wire([{ name: "handleaware", entry, canWrite: false, provider: live }]);
 
   const [p] = await listProviders();
   const st = await p.status();
@@ -183,7 +241,7 @@ await t("(3) a store HIT is legible to a provider written against {value,error}"
   const entry = writeProvider(HANDLE_AWARE);
   const live = (await import(pathToFileURL(entry).href)).credentialProvider;
   setProbeCredsRead(storeRead);
-  setProvidersUck(fakePeer([{ name: "handleaware", entry, canWrite: false, provider: live }]));
+  wire([{ name: "handleaware", entry, canWrite: false, provider: live }]);
   const [p] = await listProviders();
   // This is the measured defect: rawCredRead answers { token }, the provider
   // reads res.value. Before the fix this returned "inproc:NO-VALUE" and the
@@ -209,7 +267,7 @@ await t("(3b) a store MISS reads as 'no such cred', not as a handle decline", as
   `);
   const live = (await import(pathToFileURL(entry).href)).credentialProvider;
   setProbeCredsRead(storeMiss);
-  setProvidersUck(fakePeer([{ name: "missreader", entry, canWrite: false, provider: live }]));
+  wire([{ name: "missreader", entry, canWrite: false, provider: live }]);
   const [p] = await listProviders();
   assert.equal(await p.resolve("absent"), "MISS",
     "a 'missing' reason must read as a miss, or the provider spawns to ask the same question");
@@ -233,7 +291,7 @@ await t("(4) with NO peer wired, discovery pays for the `f providers --dump` spa
   reset();
   const entry = writeProvider(HANDLE_AWARE);
   setProbeCredsRead(storeRead);
-  // Deliberately no setProvidersUck(): this is the pre-fix world, where the only
+  // Deliberately no wired rows: this is the pre-fix world, where the only
   // route to a provider was the dump's stdout. What the peer replaces is the
   // DUMP SPAWN, so that is what this asserts on. (The status probe cannot be
   // asserted here: providers.js imports the entry path, and Node's module cache
@@ -248,16 +306,22 @@ await t("(4) with NO peer wired, discovery pays for the `f providers --dump` spa
   assert.notEqual(p.live, true, "without a peer, discovery must not claim the live path");
 });
 
-await t("(4b) a peer that throws falls back to the dump spawn instead of erroring", async () => {
+await t("(4b) in-module discovery that finds no store falls back to the dump spawn, not to an error", async () => {
+  // This case used to inject a THROWING PEER. There is no peer any more, so the
+  // equivalent failure is the one that still exists: discoverInProcess() answers
+  // null because this process never scanned a uck store. Discovery must degrade to
+  // the child rather than surface an error to `f creds get`.
   reset();
   const entry = writeProvider(HANDLE_AWARE);
   setProbeCredsRead(storeRead);
-  setProvidersUck({ name: "providers", run: () => {}, discoverInProcess: async () => { throw new Error("peer exploded"); } });
+  if (typeof __setStoreRootForTests === "function") {
+    __setStoreRootForTests(path.join(TMP, "no-such-store-" + process.pid));
+  }
   globalThis.__execStub = { ret: JSON.stringify([{ name: "handleaware", entry, canWrite: false }]) };
   const [p] = await listProviders();
-  assert.notEqual(p.live, true, "a throwing peer must degrade to the spawn path, not to an error");
+  assert.notEqual(p.live, true, "an un-scannable store must degrade to the spawn path, not to an error");
   const dump = globalThis.__execCalls.filter((c) => c[0] === "f" && (c[1] ?? []).includes("--dump"));
-  assert.equal(dump.length, 1, "a failed peer must pay the dump spawn, exactly as before the fix");
+  assert.equal(dump.length, 1, "a failed in-module discovery must pay the dump spawn, exactly as before");
 });
 
 await t("(4c) a live row without a provider object delegates to the real builder", async () => {
@@ -301,15 +365,21 @@ await t("(V1) the spawn recorder really observes execFileSync", async () => {
   const entry = writeProvider(HANDLE_AWARE);
   const live = (await import(pathToFileURL(entry).href)).credentialProvider;
   setProbeCredsRead(storeRead);
-  setProvidersUck(fakePeer([{ name: "handleaware", entry, canWrite: false, provider: live }]));
+  wire([{ name: "handleaware", entry, canWrite: false, provider: live }]);
   const [p] = await listProviders();
   await p.status();
   assert.equal(globalThis.__execCalls.length, 0, "the live path should not spawn");
-  // Force the fallback in the SAME harness and prove the recorder sees it.
-  setProvidersUck(null);
+  // Force the fallback in the SAME harness and prove the recorder sees it: aim
+  // discovery where no uck store exists, so the child path is the only answer.
+  // resetProviders() alone cannot do this - it clears the per-process memo but
+  // leaves the store pointed at a fixture, so collect() would answer and the child
+  // would never run, making this tripwire pass for the wrong reason.
+  unwire();
   resetProviders();
   globalThis.__execStub = { ret: JSON.stringify([{ name: "handleaware", entry, canWrite: false }]) };
-  const [q] = await listProviders();
+  const found = await listProviders();
+  assert.ok(found.length >= 1, "the fallback path returned no provider - the recorder cannot be observed");
+  const [q] = found;
   globalThis.__execStub = { ret: JSON.stringify({ ready: true }) };
   await q.status();
   assert.ok(globalThis.__execCalls.length >= 1,
