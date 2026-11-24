@@ -5,14 +5,14 @@
 // Provider table (see ./providers.js): every uck that exports a
 // `credentialProvider` is consulted when a name is missing from the box, and the
 // answer is mirrored back in as `mirror:<name>` with a ttl. Local always wins.
-import { registerProvider, resolveViaProvider, listProviders, providerDiscoveryError, setProbeCredsRead, setProvidersUck, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource, clearMirrorSource } from "./providers.js";
+import { registerProvider, collect as collectProviders, checkProbes as checkProviderProbes, listProviders, providerDiscoveryError, setProbeCredsRead, MIRROR_PREFIX, mirrorName, isMirrorKey, clearMisses, missBackoffLeft, mirrorSource, clearMirrorSource } from "./providers.js";
 
 import net from "node:net";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import readline from "node:readline";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1683,15 +1683,12 @@ export function register(ctx) {
       describeStatus: () => describeUnlock(unlockedState()),
     },
     run: (argv, args, ctx) => {
-      // Hand discovery the providers uck object, so it can ask for providers
-      // IN-PROCESS and get the provider OBJECTS back rather than the dump's
-      // paths. `ctx.registry` is the one sanctioned peer accessor (CONTRACT.md
-      // N20) and it exists only at run time (N19/G11), which is why this is
-      // injected here instead of imported — N4 also forbids creds reaching out
-      // of its own directory. Absent ctx (the test driver, or any uck calling
-      // run() directly) leaves the spawn path exactly as it was.
-      const registry = ctx && ctx.registry;
-      setProvidersUck(registry && typeof registry === "object" ? registry.providers ?? null : null);
+      // Provider discovery is THIS uck's own code (./providers.js), so there is
+      // nothing to hand over: no ctx.registry lookup, no peer, no load-order
+      // dependency, no `f providers --dump` child on the fast path. The old two
+      // lines here injected the sibling providers uck because discovery lived
+      // over there; it moved into creds when `providers` became `f creds
+      // providers`.
       const pos = [];
       // undefined = "the operator did not ask for a ttl". It used to be
       // initialised to DEFAULT_TTL here, which made every downstream
@@ -2195,6 +2192,49 @@ export function register(ctx) {
               clearWaiter(name);
               process.stderr.write(`f: set '${name}'\n`);
             }
+            break;
+          }
+          // `f creds providers` — the former `providers` uck, folded in as a
+          // subcommand. It is a DIAGNOSTIC surface: creds resolves through
+          // listProviders() regardless of whether anyone runs this, so nothing
+          // depends on its output. Its value is that it is the only place that
+          // separates "configured" from "working" — and, per the readiness loop
+          // below, it currently reports the FORMER, because status() does not
+          // fetch anything. Read that line as "wired up", not as "reachable".
+          case "providers": {
+            const dump = pos.includes("--dump") || pos.includes("--json");
+            const { found, skipped } = await collectProviders({ verbose: !dump });
+            await checkProviderProbes(found);
+            if (dump) {
+              process.stdout.write(JSON.stringify(found) + "\n");
+              break;
+            }
+            if (!found.length) {
+              process.stdout.write("(no credential providers — a uck exports 'credentialProvider')\n");
+            } else {
+              for (const p of found) {
+                const ttl = p.mirrorTtlSec === undefined ? "-" : `${p.mirrorTtlSec}s`;
+                const warn = p.probe && p.probe !== "ok" ? `\n  ⚠ ${p.probe}` : "";
+                process.stdout.write(`${p.name}\tuck:${p.uck}\tmirrorTtl:${ttl}${warn}\n`);
+              }
+              process.stdout.write(`ok\t${found.length} provider(s)\n`);
+            }
+            // Readiness is the thing that actually bites, so it is shown per provider
+            // rather than folded into the row. Spawning `status` is deliberate here:
+            // this command exists to test the child-process contract a real miss will
+            // pay, which the in-process path never exercises.
+            for (const p of found) {
+              try {
+                const st = JSON.parse(execFileSync(process.execPath, [p.entry, "status"], {
+                  encoding: "utf8", timeout: 20000, stdio: ["ignore", "pipe", "pipe"],
+                  env: { ...process.env, F_CREDS_NO_PROVIDER: "1" },
+                }));
+                process.stdout.write(`  ${p.name}: ${st.ready ? "ready" : "not ready"}${st.note ? ` — ${st.note}` : ""}${st.hint ? `\n    ${st.hint}` : ""}\n`);
+              } catch (e) {
+                process.stdout.write(`  ${p.name}: status probe failed (${e?.message ?? e})\n`);
+              }
+            }
+            if (skipped.length) process.stdout.write(`skipped\t${skipped.length} (see stderr with -v)\n`);
             break;
           }
           case "ls": {

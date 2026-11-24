@@ -42,7 +42,23 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
-const F = path.join(process.env.HOME ?? "", ".f");
+let F = path.join(process.env.HOME ?? "", ".f");
+
+/**
+ * Test seam: point discovery at a throwaway store root.
+ *
+ * `f` resolves its store as join(HOME, ".f", "ucks") with no env override, and F
+ * was captured at module load — so a test that wants several independent stores in
+ * one process cannot get them through the environment. This exists so
+ * test/provider-discovery.test.mjs can give every case its own store instead of
+ * sharing one and racing. Production never calls it.
+ *
+ * Moved here with the discovery engine when the `providers` uck was folded into
+ * this uck as `f creds providers`.
+ */
+export function __setStoreRootForTests(root) {
+  F = path.join(root, ".f");
+}
 const CACHE = path.join(F, ".creds-cache.json");
 
 /** Everything under this prefix is vault-sourced, never a plain cred. */
@@ -72,44 +88,22 @@ export function resetProviders() {
  * Without this, exercising the ladder offline means either shelling out to the
  * real `f` or mutating the real store — neither belongs in a unit test.
  */
-/**
- * The providers uck object, handed over by `setProvidersUck()`.
+/* The providers uck used to be a PEER, reached only through ctx.registry, and
+ * this module had a seam to inject it: `setProvidersUck(ctx.registry.providers)`.
+ * Discovery now lives HERE (see the discovery section at the bottom of this
+ * file), so the bridge is a direct call. Nothing reads ctx.registry for provider
+ * discovery any more - which also removes the only cross-uck peer dependency in
+ * either direction, and with it the load-order and cycle concerns that made the
+ * injection necessary in the first place.
  *
- * creds never imports it: N4 forbids reaching out of the uck directory, and a
- * static import would also make the creds uck depend on load order. The
- * registry is the one sanctioned peer accessor (N20), and it exists only at run
- * time (N19/G11), which is why this is injected rather than imported.
- */
-let providersUckRef = null;
-
-/**
- * Point discovery at the providers uck's in-process view. Called from creds'
- * run() with `ctx.registry.providers`. Null/absent is normal — the test driver
- * and any caller that passes no ctx — and simply leaves the spawn path in place.
- */
-export function setProvidersUck(obj) {
-  providersUckRef = obj && typeof obj === "object" ? obj : null;
-}
-
-/** Test seam: the peer object discovery would consult, or null. */
-export function providersUck() {
-  return providersUckRef;
-}
-
-/**
- * Ask the providers uck for its providers IN-PROCESS, live objects attached.
- *
- * Returns the rows, or null to mean "ask the child instead". Every failure mode
- * returns null rather than throwing: a peer that is absent, is not the real uck
- * object, does not export the accessor, or throws inside discovery must leave
- * the spawn path exactly as it was. Discovery is not allowed to become less
- * reliable in order to become cheaper.
+ * `discoverViaPeer()` keeps its name and its contract: rows, or null meaning
+ * "ask the child instead". Every failure mode still returns null rather than
+ * throwing, because discovery is not allowed to become less reliable in order to
+ * become cheaper.
  */
 async function discoverViaPeer() {
-  const peer = providersUckRef;
-  if (!peer || typeof peer.discoverInProcess !== "function") return null;
   try {
-    const rows = await peer.discoverInProcess();
+    const rows = await discoverInProcess();
     return Array.isArray(rows) ? rows : null;
   } catch {
     return null;
@@ -651,18 +645,35 @@ export async function listProviders() {
       }
       return out;
     }
+    // THE SELF-CALL. Discovery is this module's own `collect()` now, so the child
+    // process that used to run `f providers --dump` is gone: the fallback path and
+    // the fast path are the SAME code, and both return live provider objects. The
+    // spawn is kept only as a last resort for a caller that reaches this function
+    // outside a loaded f tree (a bare `node` child, a foreign ctx) where no uck
+    // store was scanned at all - `discoverInProcess()` returns null exactly there.
     try {
-      const stdout = execFileSync("f", ["providers", "--dump"], {
-        encoding: "utf8", timeout: 25_000, stdio: ["ignore", "pipe", "pipe"],
-        // Every provider child inherits this, so any nested discovery attempt
-        // returns early instead of spawning another dump.
-        env: { ...process.env, F_CREDS_NO_PROVIDER: "1" },
-      });
-      for (const p of fromChildProcess(stdout)) {
+      const self = await discoverInProcess();
+      if (self === null) throw new Error("no uck store visible to this process");
+      for (const p of fromLiveDump(self)) {
         if (!out.some((x) => x.name === p.name)) out.push(p);
       }
     } catch (e) {
-      discoveryError.message = e?.stderr?.toString?.().trim() || e?.message || String(e);
+      // Degrade to the historical child rather than failing discovery: an older or
+      // separately-installed `providers` uck still answers the same dump shape.
+      try {
+        const stdout = execFileSync("f", ["providers", "--dump"], {
+          encoding: "utf8", timeout: 25_000, stdio: ["ignore", "pipe", "pipe"],
+          // Every provider child inherits this, so any nested discovery attempt
+          // returns early instead of spawning another dump.
+          env: { ...process.env, F_CREDS_NO_PROVIDER: "1" },
+        });
+        for (const p of fromChildProcess(stdout)) {
+          if (!out.some((x) => x.name === p.name)) out.push(p);
+        }
+      } catch (e2) {
+        discoveryError.message =
+          e2?.stderr?.toString?.().trim() || e2?.message || e?.message || String(e);
+      }
     }
   }
   return out;
@@ -903,4 +914,222 @@ export async function resolveViaProvider(name, { getCred, setMirror, isFresh, is
   setMirrorSource(key, res.provider, ttlMs);
   clearMisses(name);
   return { value: res.value, provider: res.provider, mirrored: true, ttlSec };
+}
+
+
+/* -------------------------------------------------- discovery (moved from the
+   `providers` uck, which became `f creds providers` in this file)
+
+   A CREDENTIAL PROVIDER is any uck that exports a `credentialProvider` object
+   alongside `register()`:
+
+     credentialProvider: {
+       name: "vaultwarden",
+       mirrorTtlSec?: 3600,          // floor on mirror freshness (0 = always revalidate)
+       resolve(name): string|Promise<string|null>,   // null/"" = not mine; throw = unavailable
+       has?(name): boolean|Promise<boolean>,         // cheap pre-filter
+       status?(): { ready, note?, hint? },
+     }
+
+   A provider's index.js must also self-dispatch when Node runs it directly, so
+   the probe protocol works without importing the provider into the creds hot
+   path; CONTRACT.md 4.4 gives the canonical ~12-line guard and why it is an
+   implied contract rather than an import. main() handles:
+   --dump | resolve <name> | has <name> | status. */
+
+/** Probe subcommands a provider entry must answer. */
+export const PROBE_CMDS = ["resolve", "has", "status"];
+
+/**
+ * Is `p` a directory, FOLLOWING a symlink?
+ *
+ * `fs.readdirSync(..., { withFileTypes: true })` hands back `Dirent`s built from
+ * the readdir entry itself, so `Dirent.isDirectory()` is FALSE for a symlink even
+ * when the link points at a directory. Both scans below used it as their only
+ * directory test, so a uck tree staged as symlinks (a linked checkout, a store
+ * assembled out of per-uck links) came back with ZERO providers and no error of
+ * any kind: the provider listing printed the no-providers line and the run went
+ * hunting for a config problem that did not exist.
+ *
+ * `fs.statSync` follows the link, which is the question we actually care about:
+ * can this path be read as a directory. A broken link throws, and is a non-dir.
+ */
+function isDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Warn when a bucket that EXISTS contributes nothing, so a silent zero is never
+ * the only signal. Once per bucket per process, so repeated discovery does not
+ * spam. Suppressed under the recursion marker: a probe child runs this code on a
+ * path where an empty answer is expected, and noise on its stderr would be read
+ * as a provider failure by the parent that is parsing it.
+ */
+const warnedBuckets = new Set();
+function warnEmptyBucket(bucket, scanned) {
+  if (warnedBuckets.has(bucket)) return;
+  warnedBuckets.add(bucket);
+  if (process.env.F_CREDS_NO_PROVIDER) return;
+  process.stderr.write(
+    `f creds providers: warning: bucket ${bucket} yielded 0 ucks (scanned ${scanned} entr${scanned === 1 ? "y" : "ies"})\n`,
+  );
+}
+
+function buckets() {
+  try {
+    return fs.readdirSync(path.join(F, "ucks"), { withFileTypes: true })
+      .filter((d) => isDir(path.join(F, "ucks", d.name)))
+      .map((d) => path.join(F, "ucks", d.name));
+  } catch {
+    return [];
+  }
+}
+
+/** All uck dirs across buckets: { name, dir }. Duplicates resolve first-bucket-wins. */
+export function uckDirs() {
+  const out = [];
+  const seen = new Set();
+  for (const bucket of buckets()) {
+    let entries;
+    try {
+      entries = fs.readdirSync(bucket, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    let scanned = 0;
+    let fromBucket = 0;
+    for (const ent of entries.sort((a, b) => (a.name < b.name ? -1 : 1))) {
+      scanned++;
+      if (seen.has(ent.name)) continue;
+      // Directory-ness is resolved through a symlink — see isDir().
+      const dir = path.join(bucket, ent.name);
+      if (!isDir(dir)) continue;
+      const entry = path.join(dir, "index.js");
+      if (!fs.existsSync(entry)) continue;
+      seen.add(ent.name);
+      fromBucket++;
+      out.push({ name: ent.name, dir, entry });
+    }
+    // A bucket that exists but contributes nothing is the silent-zero case; say
+    // so on stderr rather than letting `providers: none` stand as the whole story.
+    // This is about the SCAN: a bucket of non-provider ucks is healthy here and is
+    // reported by collect()'s own "(no credential providers…)" line, not by us.
+    if (fromBucket === 0) warnEmptyBucket(bucket, scanned);
+  }
+  return out;
+}
+
+/**
+ * Live `credentialProvider` objects by entry path, filled by the most recent
+ * `collect()`. `found` is deliberately plain serialisable data (it is what
+ * `--dump` prints and what the listing renders), so the objects themselves ride
+ * alongside it here rather than inside it.
+ */
+const providerByEntry = new Map();
+
+/**
+ * Import every uck and collect its `credentialProvider` export.
+ * Import failures are skipped with a note — a broken uck must not blind creds.
+ */
+export async function collect({ verbose } = {}) {
+  providerByEntry.clear();
+  const found = [];
+  const skipped = [];
+  for (const u of uckDirs()) {
+    let mod;
+    try {
+      mod = await import(pathToFileURL(u.entry).href);
+    } catch (e) {
+      skipped.push({ ...u, reason: `import failed: ${e?.message ?? e}` });
+      continue;
+    }
+    const p = mod?.credentialProvider ?? mod?.default?.credentialProvider;
+    if (!p) continue;
+    const problems = [];
+    if (typeof p.name !== "string" || !p.name) problems.push("missing name");
+    if (typeof p.resolve !== "function") problems.push("missing resolve()");
+    if (problems.length) {
+      skipped.push({ ...u, reason: `invalid credentialProvider (${problems.join(", ")})` });
+      continue;
+    }
+    found.push({
+      name: p.name,
+      uck: u.name,
+      entry: u.entry,
+      // Advertised by the provider's credentialProvider; gates `creds set` dual-write.
+      // Must be copied here — dropping it makes every provider look read-only to `set`.
+      canWrite: p.canWrite === true,
+      mirrorTtlSec: typeof p.mirrorTtlSec === "number" ? p.mirrorTtlSec : undefined,
+    });
+    providerByEntry.set(u.entry, p);
+  }
+  if (verbose) for (const s of skipped) process.stderr.write(`f creds providers: skip ${s.name}: ${s.reason}\n`);
+  return { found, skipped };
+}
+
+/**
+ * Every child that runs a provider probe must carry the recursion marker.
+ *
+ * This module honours `F_CREDS_NO_PROVIDER` and cuts discovery, and a provider
+ * honours it to answer "configured" without touching the store. The listing
+ * spawns the same probes, so the marker is set here once rather than left to each
+ * call site: it is the single fact every probe caller needs. Skipping it is how a
+ * listing came to print `not ready — creds locked` next to a `f creds status`
+ * saying `unlocked` — the probe child read a live store it had been told not to.
+ */
+const probeEnv = () => ({ ...process.env, F_CREDS_NO_PROVIDER: "1" });
+
+/**
+ * Probe self-test (G6-adjacent): a provider whose `index.js` is not a working
+ * CLI entry fails silently on first `f creds get` miss. Run `status` as a
+ * child (exactly what the readiness section does) and report the wiring
+ * problem at list time instead.
+ *
+ * Returns found[] with an extra `probe: "ok" | <problem string>` field.
+ */
+export async function checkProbes(found) {
+  for (const p of found) {
+    try {
+      const out = execFileSync(process.execPath, [p.entry, "status"], {
+        encoding: "utf8", timeout: 20000, stdio: ["ignore", "pipe", "pipe"],
+        env: probeEnv(),
+      });
+      JSON.parse(out); // must be machine-readable
+      p.probe = "ok";
+    } catch (e) {
+      const m = String(e?.stderr || e?.message || e).split("\n")[0].slice(0, 120);
+      p.probe = m ? `probe failed: ${m}` : "probe failed";
+    }
+  }
+  return found;
+}
+
+/**
+ * Discovery, in-process, with the LIVE provider objects attached.
+ *
+ * `f` loads every uck in ONE process, so when `f creds` runs discovery it is
+ * standing in the same process as every provider this scan has already imported.
+ * Asking them directly replaces the child-process dump entirely, and — the part
+ * that actually matters — hands back the provider OBJECTS, so the instance creds
+ * probes is the instance whose `status()` produced the row. The dump's stdout
+ * could only ever carry a path, and a path cannot carry a store handle; that is
+ * why the handle used to be built, offered, and thrown away.
+ *
+ * `checkProbes` is skipped deliberately: it spawns `node <entry> status` for
+ * every provider, which is exactly the child this call exists to avoid, and its
+ * result (`probe`) is display-only. A caller that wants the self-test calls
+ * `collect()` + `checkProbes()` itself, as the `providers` subcommand does.
+ *
+ * Returns null when discovery cannot be answered here (no uck store), so the
+ * caller falls back to the self-spawn unchanged.
+ */
+export async function discoverInProcess() {
+  if (!buckets().length) return null;
+  const { found } = await collect({ verbose: false });
+  if (!found.length) return [];
+  return found.map((row) => ({ ...row, provider: providerByEntry.get(row.entry) ?? null }));
 }
