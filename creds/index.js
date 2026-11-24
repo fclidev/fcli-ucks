@@ -1705,6 +1705,7 @@ export function register(ctx) {
       let outDir = null;
       let asStdin = null;
       let jsonOut = false;
+      let dumpOut = false;
       let localOnly = false;      // --local: never consult providers
       let forceProvider = false;  // --vault: bypass local + mirror, ask providers now
       let showSource = false;     // --source: print provenance alongside the value
@@ -1753,6 +1754,12 @@ export function register(ctx) {
           asStdin = a[++i];
         } else if (a[i] === "--json") {
           jsonOut = true;
+        } else if (a[i] === "--dump") {
+          // Parsed, like every other flag, because the unknown-flag guard runs
+          // BEFORE the switch: an unparsed `--dump` is rejected there and so can
+          // never be honoured by the `providers` case. It is also never pushed to
+          // `pos`, so reading it off `pos` could never have worked either.
+          dumpOut = true;
         } else if (a[i] === "--local") {
           localOnly = true;
         } else if (a[i] === "--vault") {
@@ -2202,7 +2209,12 @@ export function register(ctx) {
           // below, it currently reports the FORMER, because status() does not
           // fetch anything. Read that line as "wired up", not as "reachable".
           case "providers": {
-            const dump = pos.includes("--dump") || pos.includes("--json");
+            // Machine output = parsed `--dump` OR `--json`. Both were accepted by
+            // the `providers` uck this verb replaced, and `--json` is a global
+            // flag every other verb honours, so dropping either would silently
+            // change what a caller gets. `pos.includes(...)` could never fire:
+            // parsed flags never reach `pos`.
+            const dump = dumpOut || jsonOut;
             const { found, skipped } = await collectProviders({ verbose: !dump });
             await checkProviderProbes(found);
             if (dump) {
@@ -2502,6 +2514,9 @@ function usage(msg) {
       "                                    permanent-unlock marker (--purge deletes the\n" +
       "                                    key file too)\n" +
       "  status                          locked / unlocked + time left, + provider readiness\n" +
+      "  providers [--dump|--json]       list credential providers; --dump/--json\n" +
+      "                                    emit the machine contract that provider\n" +
+      "                                    discovery spawns for\n" +
       "  set <name> [value|-]           store a cred (also clears that name's mirror);\n" +
       "                                    no value (or `-`) reads stdin, and a TTY\n" +
       "                                    prompts without echo, so the secret\n" +

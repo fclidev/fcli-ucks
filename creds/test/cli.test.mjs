@@ -609,6 +609,54 @@ await t("`--dir X --force` no longer swallows --force (double-increment)", async
   assert.match(r.out, /restored\tfile:/, `--force lost, unpack refused to overwrite: ${r.err}`);
 });
 
+await t("`providers --dump` emits the machine contract, not a usage error", async () => {
+  // The `providers` uck was folded into this uck as `f creds providers`, and its
+  // `--dump` flag was rejected by the top-level parser: the unknown-flag guard
+  // runs BEFORE the switch, so a flag the parser does not know can never be
+  // honoured by a case, and `pos.includes("--dump")"` could never fire because
+  // parsed flags never reach `pos`. Nothing caught it because no test asked for
+  // the flag, and the human listing looked fine next to the broken dump.
+  const dump = run(["providers", "--dump"]);
+  assert.equal(dump.code, 0, `providers --dump must succeed, got ${dump.code}: ${dump.err.slice(0, 120)}`);
+  const rows = JSON.parse(dump.out);
+  assert.ok(Array.isArray(rows), `--dump must print a JSON array, got: ${dump.out.slice(0, 120)}`);
+});
+
+await t("`providers --json` is the same contract as --dump (flag-blindness guard)", async () => {
+  const a = run(["providers", "--dump"]);
+  const b = run(["providers", "--json"]);
+  assert.equal(b.code, 0, `providers --json failed: ${b.err.slice(0, 120)}`);
+  assert.equal(b.out, a.out, "--json and --dump must print the same machine output");
+  assert.doesNotMatch(b.out, /^vaultwarden\t/m, "--json must not print the human table");
+});
+
+await t("bare `providers` stays human-readable (the dump must not become default)", async () => {
+  const bare = run(["providers"]);
+  assert.equal(bare.code, 0, `bare providers regressed: ${bare.err.slice(0, 120)}`);
+  // Shape test, not a parse test: a short tab-separated line COERCES to a Number,
+  // so `JSON.parse` does not throw and the naive assertion passes for the wrong
+  // reason. Ask whether it is an array/object, which is what a dump is.
+  let parsed = null;
+  try { parsed = JSON.parse(bare.out); } catch { /* expected */ }
+  assert.ok(parsed === null || (typeof parsed !== "object" || parsed === null),
+    `bare providers must print the human table, not the dump: ${bare.out.slice(0, 80)}`);
+  // Non-empty and not JSON is the invariant. Do NOT assert a table shape here:
+  // this suite runs in an isolated HOME with no uck store, so the honest human
+  // answer is the "(no credential providers …)" note.
+  assert.ok(bare.out.trim().length > 0, "bare providers printed nothing");
+});
+
+await t("USAGE advertises `providers`, and the verb actually dispatches", async () => {
+  // Same drift this suite was written for: help listing a command that hits
+  // `default: usage()`. Now the inverse — a verb that works but is undocumented
+  // is unreachable, since it replaced a top-level uck people will type from memory.
+  const r = run(["no-such-verb"], { allowFail: true });
+  const listed = r.err.split("\n").find((l) => /^\s+providers\b/.test(l));
+  assert.ok(listed, `usage must list the providers verb:\n${r.err.slice(0, 400)}`);
+  const real = run(["providers"]);
+  assert.equal(real.code, 0, `usage lists 'providers' but it does not dispatch: ${real.err.slice(0, 120)}`);
+});
+
 await t("top-level `ls --all` still shows mirrors (no regression)", async () => {
   run(["set", "plain-for-all", "v"]);
   await putMirror("mir-for-all", "v");
