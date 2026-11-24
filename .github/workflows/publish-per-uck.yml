@@ -302,15 +302,27 @@ jobs:
           # publish succeeded - and a hand-rolled curl on the tarball is NOT the
           # installability predicate, `npm install` is. Poll; verify by installing.
           got=""
-          for i in $(seq 1 24); do
-            sleep 10
+          # 90 x 20s = 30 minutes. The old budget was 24 x 10s = 4 minutes, and it failed a
+          # SUCCESSFUL publish: @fcli.dev/skills@0.4.3 published fine (the npm step returned
+          # success) and this step timed out anyway, turning a green release red. Locally the
+          # package doc still needed four separate polls before `npm install` could resolve
+          # the version that the doc already advertised. npm answers a publish with a 202 and
+          # the words 'a few minutes', but replication is not bounded by that sentence.
+          #
+          # Asymmetric cost: waiting too long only makes the job longer. Guessing too short
+          # produces a false alarm that invites someone to re-run the tag - and the re-run
+          # then collides with 'version already published', which is exactly what attempt 2 of
+          # that same run did. So the alarm was wrong twice: once about the publish, once
+          # about what a retry could fix.
+            for i in $(seq 1 90); do
+            sleep 20
             doc="$(curl -sS -m 30 "$enc" || true)"
             got="$(printf '%s' "$doc" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s)["dist-tags"]?.latest ?? "")}catch{console.log("")}})')"
             echo "attempt $i: registry latest for $pkg = ${got:-<none>}"
             [ "$got" = "$ver" ] && break
           done
           if [ "$got" != "$ver" ]; then
-            echo "::error::expected $pkg@$ver to be latest; registry says '${got:-<none>}'. If <none>, the publish was accepted (202) but had not replicated within the poll window - re-read the package doc before believing this. Otherwise check that this tag's dir matches the manifest name and that the manifest version equals the tag version."
+            echo "::error::expected $pkg@$ver to be latest after a 30-minute poll; registry says '${got:-<none>}'. If <none>, the publish was accepted (202) but had not replicated within the poll window - re-read the package doc before believing this. Otherwise check that this tag's dir matches the manifest name and that the manifest version equals the tag version."
             exit 1
           fi
           # Installability, proven the way a consumer proves it: a clean install from
