@@ -293,4 +293,51 @@ describe("set / get / remove", () => {
       }
       expect(JSON.parse(readFileSync(file, "utf8")).ucks).toEqual([["a", "b"]]);
     }));
+
+  test("filter-based get, set, and remove (including multi-match array removal)", async () =>
+    withHome(async ({ home, cwd, file }) => {
+      write(file, {
+        ucks: [
+          { source: "./old", keep: false },
+          { source: "./keep", keep: true },
+          { source: "./old", keep: false },
+        ],
+      });
+      const got = await runConfig(["get", 'ucks[?(@.keep==true)].source'], { home, cwd, file });
+      expect(got.code).toBe(0);
+      expect(got.out.trim()).toBe("./keep");
+
+      // Multi-match remove via filter (the usage() example pattern)
+      const rm = await runConfig(["remove", 'ucks[?(@.source=="./old")]'], { home, cwd, file });
+      expect(rm.code).toBe(0);
+      expect(rm.doc.ucks).toEqual([{ source: "./keep", keep: true }]);
+    }));
+
+  test("supports explicit $-prefixed paths, RFC 9535 negative indices, and set [$]", async () =>
+    withHome(async ({ home, cwd, file }) => {
+      write(file, { ucks: ["first", "second", "third"] });
+      const last = await runConfig(["get", "$.ucks[-1]"], { home, cwd, file });
+      expect(last.code).toBe(0);
+      expect(last.out.trim()).toBe("third");
+
+      const upd = await runConfig(["set", "$.ucks[-1]", "updated"], { home, cwd, file });
+      expect(upd.code).toBe(0);
+      expect(upd.doc.ucks).toEqual(["first", "second", "updated"]);
+
+      const pushed = await runConfig(["set", "ucks[$]", "fourth"], { home, cwd, file });
+      expect(pushed.code).toBe(0);
+      expect(pushed.doc.ucks).toEqual(["first", "second", "updated", "fourth"]);
+    }));
+
+  test("handles JSON Pointer escaped keys (~ and /) on set and remove", async () =>
+    withHome(async ({ home, cwd, file }) => {
+      write(file, { map: { "a/b": 1, "c~d": 2 } });
+      const s = await runConfig(["set", "$.map['a/b']", "10"], { home, cwd, file });
+      expect(s.code).toBe(0);
+      expect(s.doc.map["a/b"]).toBe(10);
+
+      const rm = await runConfig(["remove", "$.map['c~d']"], { home, cwd, file });
+      expect(rm.code).toBe(0);
+      expect(rm.doc.map).toEqual({ "a/b": 10 });
+    }));
 });

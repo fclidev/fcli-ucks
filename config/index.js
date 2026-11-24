@@ -1,9 +1,44 @@
-import { createRequire } from "node:module";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from "node:fs";
 import { join, dirname, resolve, isAbsolute, sep } from "node:path";
+import { Piffero } from "piffero-plus";
 
-const require = createRequire(import.meta.url);
-const { JSONPath } = require("jsonpath-plus");
+/** Ensure a JSONPath expression starts with "$" (f config allows bare paths like "ucks[0]"). */
+function normalizePath(path) {
+  if (!path || path.startsWith("$")) return path;
+  if (path.startsWith("[") || path.startsWith(".")) return `$${path}`;
+  return `$.${path}`;
+}
+
+/** Resolve { parent, parentProperty } from an RFC 6901 JSON Pointer against doc. */
+function resolvePointerParent(doc, pointer) {
+  if (!pointer || pointer === "/") return { parent: null, parentProperty: null };
+  const tokens = pointer
+    .slice(1)
+    .split("/")
+    .map((t) => t.replace(/~1/g, "/").replace(/~0/g, "~"));
+  let parent = doc;
+  for (let i = 0; i < tokens.length - 1; i++) {
+    if (parent == null || typeof parent !== "object") {
+      return { parent: null, parentProperty: null };
+    }
+    parent = parent[tokens[i]];
+  }
+  const last = tokens[tokens.length - 1];
+  return { parent, parentProperty: Array.isArray(parent) ? Number(last) : last };
+}
+
+/** Query matching values via piffero-plus. */
+function queryValues(doc, path) {
+  return Piffero.query(doc, normalizePath(path));
+}
+
+/** Query matches with resolved { value, path, pointer, parent, parentProperty } records. */
+function queryAll(doc, path) {
+  return Piffero.query(doc, normalizePath(path), { resultType: "all" }).map((item) => ({
+    ...item,
+    ...resolvePointerParent(doc, item.pointer),
+  }));
+}
 
 /** Resolve the config file for a target: "project" | "global" | explicit path. */
 function resolveTarget(target) {
@@ -115,8 +150,8 @@ const configApi = {
     const file = resolveTarget(target);
     const doc = readDoc(file);
     if (!path) return doc;
-    const res = JSONPath({ path, json: doc, wrap: true });
-    if (!Array.isArray(res) || res.length === 0) return null;
+    const res = queryValues(doc, path);
+    if (res.length === 0) return null;
     // unwrap single match to its natural value; keep arrays for multi-match
     return res.length === 1 ? res[0] : res;
   },
@@ -160,10 +195,14 @@ const configApi = {
 
 /** Set via resultType all (parent + parentProperty). */
 function applySet(doc, path, value) {
-  // If the path selects nothing, create it by walking segments.
-  const existing = JSONPath({ path, json: doc, wrap: true });
-  if (Array.isArray(existing) && existing.length > 0) {
-    const all = JSONPath({ path, json: doc, resultType: "all" });
+  // Append syntax (e.g. "ucks[$]") creates/pushes directly.
+  if (path.endsWith("[$]")) {
+    setPathCreate(doc, path, value);
+    return;
+  }
+  // If the path selects existing node(s), update them in place.
+  const all = queryAll(doc, path);
+  if (all.length > 0) {
     for (const item of all) {
       if (item.parent && item.parentProperty != null) {
         item.parent[item.parentProperty] = value;
@@ -220,7 +259,7 @@ function applyAdd(doc, path, value) {
   const segments = parseSegments(clean);
   if (segments.length === 0) throw new Error(`config: '${path}' is not a usable path`);
   const leaf = segments.at(-1);
-  const matches = JSONPath({ path: clean, json: doc, resultType: "all" });
+  const matches = queryAll(doc, clean);
   const anchor = matches[0];
   const parent = anchor && "parent" in anchor ? anchor.parent : undefined;
   const prop = anchor && "parentProperty" in anchor ? anchor.parentProperty : undefined;
@@ -283,9 +322,11 @@ function applyAdd(doc, path, value) {
 
 function applyRemove(doc, path) {
   // Collect parents+indices for array elements, or keys for object props.
-  const all = JSONPath({ path, json: doc, resultType: "all" });
+  // Iterate in reverse so splicing multiple indices from the same array does not shift earlier indices.
+  const all = queryAll(doc, path);
   let removed = 0;
-  for (const item of all) {
+  for (let i = all.length - 1; i >= 0; i--) {
+    const item = all[i];
     if (item.parent == null) continue;
     const pp = item.parentProperty;
     if (Array.isArray(item.parent)) {
