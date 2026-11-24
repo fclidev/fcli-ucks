@@ -1,0 +1,40 @@
+name: check
+
+# The cheapest gate that matters for a repo whose entire product is code that
+# only runs when a human types `f <name>`: every tracked file must at least
+# parse, and every uck must still look like something the loader can import.
+# The checks live in scripts/check.mjs so they can be run by hand before
+# pushing; this file only wires them to a runner.
+#
+# Ported from the proven Forgejo-side workflow (kensand.net/kensand-fcli-ucks
+# .forgejo/workflows/build.yml, PR #3), which was proven non-vacuous there:
+# green on valid commits, red on injected syntax errors, red on a dropped
+# `export register()`. Only the runner wiring changed; GitHub Actions needs
+# none of the Forgejo runner workarounds, so actions here match the repo's
+# own publish.yml (@v4 tags) and setup-node pins the Node the package engines
+# field demands (>=22.14).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: toolchain
+        run: |
+          node --version
+          bash --version | head -1
+
+      - name: parse everything, check every uck
+        run: node scripts/check.mjs
