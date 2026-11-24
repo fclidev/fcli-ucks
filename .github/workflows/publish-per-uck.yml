@@ -230,9 +230,17 @@ jobs:
           # Cheap explicit restatement of the two invariants, so a future refactor
           # of verify-install.mjs cannot quietly drop them for the package this tag
           # actually names.
-          tar -tzf "$tgz" | grep -q '^package/index\.js$' \
+          # Collect the listing ONCE, then test it. `tar | grep -q` is a trap under
+          # `set -o pipefail`: grep -q exits on its first match and closes the pipe, so tar
+          # dies of SIGPIPE and the pipeline status is 141 - a FAILURE - even when the member
+          # is present. Measured on a real tarball: the listing printed package/index.js and
+          # the pipeline still returned 141, which failed verify and skipped publish for a
+          # healthy package. The assertion was never wrong about the artifact, only about its
+          # own exit code - same class as reading a pipeline's $? as a command's status.
+          listing="$(tar -tzf "$tgz")"
+          printf '%s\n' "$listing" | grep -q '^package/index\.js$' \
             || { echo "::error::$tgz has no package/index.js — nothing would register"; exit 1; }
-          tar -tzf "$tgz" | grep -q '^package/package\.json$' \
+          printf '%s\n' "$listing" | grep -q '^package/package\.json$' \
             || { echo "::error::$tgz has no package.json — npm would reject it"; exit 1; }
 
   # ---------------------------------------------------------------------------
