@@ -24,6 +24,13 @@ name: publish-per-uck
 #     Repository:    fcli-ucks
 #     Environment:   npm                <- MUST equal `environment:` below
 #     Package:       @fcli.dev/config   <- exactly one package per publisher
+#
+# ONE PUBLISHER PER PUBLISHED PACKAGE, and the set is SIX, not seven:
+#   config creds search skills uck v
+# There is deliberately NO `providers` publisher: that uck was folded into
+# creds as `f creds providers`, so nothing in this repo builds that package any
+# more. A `fcli.dev/providers@<ver>` tag fails at tag validation below, before
+# any publish attempt - so an unused publisher for it would just expire.
 #   Then approve the pending request in the npm UI.
 #
 # GitHub-side: Settings -> Environments -> create `npm`. Optionally add a
@@ -247,7 +254,7 @@ jobs:
             [ "$got" = "$ver" ] && break
           done
           if [ "$got" != "$ver" ]; then
-            echo "::error::expected $pkg@$ver to be latest; registry says '${got:-<none>}'. Check the trusted publisher entry and the package name."
+            echo "::error::expected $pkg@$ver to be latest; registry says '${got:-<none>}'. If <none>, the publish was accepted (202) but had not replicated within the poll window - re-read the package doc before believing this. Otherwise check that this tag's dir matches the manifest name and that the manifest version equals the tag version."
             exit 1
           fi
           # Installability, proven the way a consumer proves it: a clean install from
