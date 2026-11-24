@@ -51,6 +51,28 @@ name: publish-per-uck
 # https://github.blog/changelog/2025-07-31/npm-trusted-publishing-with-oidc-is-generally-available/
 
 on:
+  # Manual entry point, in addition to the tag push trigger.
+  #
+  # WHY THIS EXISTS. The tag push trigger did not create a single run for six
+  # pushed tags (verified: workflow active, file present on the tag commit, glob
+  # matches, no run object for any tag). Before that root cause is settled, a
+  # dispatch is the only way to prove the workflow itself can publish - and it
+  # doubles as the operator's manual override.
+  #
+  # It is NOT a substitute for the tag trigger: a dispatch supplies inputs, so the
+  # version below must come from the operator, and nothing here reads a git tag.
+  workflow_dispatch:
+    inputs:
+      uck:
+        description: "uck directory to publish (config, creds, search, skills, uck, v)"
+        required: true
+        type: choice
+        options: [config, creds, search, skills, uck, v]
+      version:
+        description: "version to publish, exactly as in <uck>/package.json (e.g. 0.4.3)"
+        required: true
+        type: string
+
   push:
     # Tags are `<flattened-scope>/<dir>@<semver>`:
     #     fcli.dev/config@0.4.2     fcli.dev/creds@0.4.2
@@ -85,7 +107,17 @@ jobs:
         id: pick
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          # A dispatch carries no tag ref, so synthesise the SAME tag string the
+          # push trigger would have carried. Deliberately NOT a separate code path:
+          # one grammar, one validation, one set of outputs, so a manual publish
+          # cannot skip a check that an automatic one had to pass. The inputs are
+          # operator-supplied, which is why the version is still re-checked against
+          # package.json below rather than trusted.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="fcli.dev/${{ inputs.uck }}@${{ inputs.version }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
           # ONE anchored grammar, deliberately not substring surgery: splitting on
           # '/' and '@' independently produced a WRONG version for a valid tag when
           # this file was drafted (caught by running the matrix, not by reading).
