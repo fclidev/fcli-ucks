@@ -3,9 +3,6 @@
   "type": "module",
   "description": "f uck: edit f.config.json via JSONPath",
   "main": "index.js",
-  "dependencies": {
-    "jsonpath-plus": "^11.2.0"
-  },
   "version": "0.4.3",
   "license": "GPL-3.0-only",
   "keywords": [
@@ -24,5 +21,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "piffero-plus": "^1.2.0"
   }
 }

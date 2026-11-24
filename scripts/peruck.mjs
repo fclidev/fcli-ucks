@@ -132,11 +132,10 @@ function importsOf(name) {
   // called it dependency-free - the import then fails in a clean store (verified:
   // config is the one uck that cannot be imported in this checkout).
   const specifiers = [...src.matchAll(/(?:from|import|require)\s*\(?\s*["']([^"'\n]+)["']/g)].map((m) => m[1]);
-  // PROOF THAT THE PROSE FILTER DID NOT BLIND THE SCANNER: jsonpath-plus must still be
-  // present after codeOnly(). Its only occurrence is `require("jsonpath-plus")` via
-  // createRequire, so if it vanishes this function is eating real dependencies.
-  if (name === "config" && !src.includes("jsonpath-plus")) {
-    throw new Error("peruck.mjs: prose filter destroyed a real require() in config/index.js");
+  // PROOF THAT THE PROSE FILTER DID NOT BLIND THE SCANNER: piffero-plus must still be
+  // present after codeOnly(). If it vanishes, this function is eating real dependencies.
+  if (name === "config" && !src.includes("piffero-plus")) {
+    throw new Error("peruck.mjs: prose filter destroyed a real import in config/index.js");
   }
   // Guard for the OLD vendored-uckmain shape. It used to be keyed to the
   // `providers` uck specifically; that uck is gone (its command is now
@@ -263,7 +262,7 @@ for (const name of uckDirs) {
   // reviewed map of registry-verified versions (verified 2026-11-23 via
   // `npm view <pkg> version`, a read). An unmapped dep is reported as NEEDS-VERSION
   // and NOT written, rather than shipping a version we did not verify.
-  const KNOWN_VERSIONS = { "jsonpath-plus": "^11.3.0" };
+  const KNOWN_VERSIONS = { "piffero-plus": "^1.2.0" };
   if (realDeps.length) {
     next.dependencies = { ...(cur.dependencies ?? {}) };
     for (const d of realDeps) {
